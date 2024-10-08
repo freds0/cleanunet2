@@ -94,9 +94,6 @@ def validate(model, val_loader, loss_fn, iteration, trainset_config, logger, dev
 
 
 def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_cleanunet_path, checkpoint_cleanspecnet_path, log, optimization, loss_config=None, device=None):
-    n_iter =  0
-    total_iters = 1e5
-
     device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Create tensorboard logger.
@@ -129,21 +126,13 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
 
     # define optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    # define learning rate scheduler
-    scheduler = LinearWarmupCosineDecay(
-                    optimizer,
-                    lr_max=learning_rate,
-                    n_iter=total_iters,
-                    iteration=n_iter,
-                    divider=25,
-                    warmup_proportion=0.05,
-                    phase=('linear', 'cosine'),
-                )
 
     # load checkpoint
+    global_step = 0
     if checkpoint_path is not None:
         if os.path.exists(checkpoint_path):
-            model = load_checkpoint(checkpoint_path, model)
+            model, optimizer, learning_rate, iteration = load_checkpoint(checkpoint_path, model)
+            global_step = iteration + 1
         else:
             print(f'No valid checkpoint model found at {checkpoint_path}.')
             exit()
@@ -172,18 +161,29 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
             print(f'No valid checkpoint model found at {checkpoint_cleanspecnet_path}.')
             exit()
 
+    # define learning rate scheduler
+    scheduler = LinearWarmupCosineDecay(
+                    optimizer,
+                    lr_max=learning_rate,
+                    n_iter=optimization["n_iters"],
+                    iteration=global_step,
+                    divider=25,
+                    warmup_proportion=0.05,
+                    phase=('linear', 'cosine'),
+                )
+
     # define multi resolution stft loss
     if loss_config["stft_lambda"] > 0:
-        mrstftloss = MultiResolutionSTFTLoss(**loss_config["stft_config"]).cuda()
+        mrstftloss = MultiResolutionSTFTLoss(**loss_config["stft_config"]).to(device)
     else:
         mrstftloss = None
 
     loss_fn = CleanUNet2Loss(**loss_config, mrstftloss=mrstftloss)
 
-    global_step = 0
+
     epoch = 1
     print("Starting training...")
-    while global_step < total_iters + 1:    
+    while global_step < optimization["n_iters"] + 1:    
         # for each epoch
         for step, (clean_audio, clean_spec, noisy_audio, noisy_spec) in enumerate(trainloader):
 
@@ -197,12 +197,11 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
             denoised_audio, denoised_spec = model(noisy_audio, noisy_spec)
             # calculate loss
             loss = loss_fn(clean_audio, denoised_audio)
-            '''
             if num_gpus > 1:
                 reduced_loss = reduce_tensor(loss.data, num_gpus).item()
             else:
                 reduced_loss = loss.item()            
-            '''                
+               
             # back-propagation
             loss.backward()
             # gradient clipping
@@ -216,12 +215,12 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
 
             if global_step > 0 and global_step % 10 == 0: 
                 # save to tensorboard
-                logger.add_scalar("Train/Train-Loss", loss.item(), global_step)
+                logger.add_scalar("Train/Train-Loss", reduced_loss, global_step)
                 #logger.add_scalar("Train/Train-Reduced-Loss", reduced_loss, global_step)
                 logger.add_scalar("Train/Gradient-Norm", grad_norm, global_step)
                 logger.add_scalar("Train/learning-rate", optimizer.param_groups[0]["lr"], global_step)
 
-            if global_step > 0 and global_step % iters_per_valid == 0:# and rank == 0:
+            if global_step > 0 and global_step % iters_per_valid == 0 and rank == 0:
                 validate(model, testloader, loss_fn, global_step, trainset_config, logger, device)
                 
             # save checkpoint
