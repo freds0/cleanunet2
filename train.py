@@ -111,6 +111,10 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
     logger = prepare_directories_and_logger(
         output_dir, log_directory, ckpt_dir, rank=0)
 
+    # distributed running initialization
+    if num_gpus > 1:
+        init_distributed(rank, num_gpus, group_name, **dist_config)   
+
     trainloader, testloader = load_cleanunet2_dataset(**trainset_config, 
                                 batch_size=batch_size, 
                                 num_gpus=1)
@@ -177,7 +181,7 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
                     n_iter=optimization["n_iters"],
                     iteration=global_step,
                     divider=25,
-                    warmup_proportion=0.05,
+                    warmup_proportion=0.01,
                     phase=('linear', 'cosine'),
                 )
 
@@ -232,7 +236,7 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
                 validate(model, testloader, loss_fn, global_step, trainset_config, logger, device)
                 
             # save checkpoint
-            if global_step > 0 and global_step % iters_per_ckpt == 0:
+            if global_step > 0 and global_step % iters_per_ckpt == 0 and rank == 0:
                 checkpoint_name = '{}.pkl'.format(global_step)
                 checkpoint_path = os.path.join(ckpt_dir, checkpoint_name)
                 save_checkpoint(model, optimizer, learning_rate, global_step, checkpoint_path)
