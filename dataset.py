@@ -79,6 +79,8 @@ class CleanUNet2Dataset(Dataset):
         else:
             audio_wav = audio_wav.squeeze(0)
             
+        audio_wav = audio_wav / audio_wav.abs().max()
+        
         return audio_wav
     
 

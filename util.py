@@ -49,19 +49,22 @@ def print_size(net, keyword=None):
     """
 
     if net is not None and isinstance(net, torch.nn.Module):
-        module_parameters = filter(lambda p: p.requires_grad, net.parameters())
-        params = sum([np.prod(p.size()) for p in module_parameters])
+        # Total number of parameters (trainable and non-trainable)
+        total_params = sum(p.numel() for p in net.parameters())
+        # Number of trainable parameters
+        trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
         
-        print("{} Parameters: {:.6f}M".format(
-            net.__class__.__name__, params / 1e6), flush=True, end="; ")
+        print("{} - Total Parameters: {:.6f}M; Trainable Parameters: {:.6f}M".format(
+            net.__class__.__name__, total_params / 1e6, trainable_params / 1e6), flush=True)
         
         if keyword is not None:
-            keyword_parameters = [p for name, p in net.named_parameters() if p.requires_grad and keyword in name]
-            params = sum([np.prod(p.size()) for p in keyword_parameters])
-            print("{} Parameters: {:.6f}M".format(
-                keyword, params / 1e6), flush=True, end="; ")
-        
-        print(" ")
+            # Parameters associated with the keyword
+            keyword_params = [p for name, p in net.named_parameters() if keyword in name]
+            keyword_total_params = sum(p.numel() for p in keyword_params)
+            keyword_trainable_params = sum(p.numel() for p in keyword_params if p.requires_grad)
+            
+            print("'{0}' - Total Parameters: {1:.6f}M; Trainable Parameters: {2:.6f}M".format(
+                keyword, keyword_total_params / 1e6, keyword_trainable_params / 1e6), flush=True)
 
 
 ####################### lr scheduler: Linear Warmup then Cosine Decay #############################
@@ -181,8 +184,7 @@ def sampling(net, noisy_audio):
 
 ####################### train util #############################
 
-def load_checkpoint(checkpoint_path, model):
-    assert os.path.isfile(checkpoint_path)
+def load_checkpoint(checkpoint_path, model, optimizer):
     print("Loading checkpoint '{}'".format(checkpoint_path))
     checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')    
     model.load_state_dict(checkpoint_dict['state_dict'])

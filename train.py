@@ -118,6 +118,13 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
     # initialize the model
     model = CleanUNet2(**network_config).to(device)
     model.train()
+
+    for param in model.clean_spec_net.parameters():
+        param.requires_grad = False
+
+    #for param in model.clean_unet.parameters():
+    #    param.requires_grad = False
+    #             
     print_size(model)
 
     # apply gradient all reduce
@@ -131,7 +138,8 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
     global_step = 0
     if checkpoint_path is not None:
         if os.path.exists(checkpoint_path):
-            model, optimizer, learning_rate, iteration = load_checkpoint(checkpoint_path, model)
+            print("Loading checkpoint '{}'".format(checkpoint_path))
+            model, optimizer, learning_rate, iteration = load_checkpoint(checkpoint_path, model, optimizer)
             global_step = iteration + 1
         else:
             print(f'No valid checkpoint model found at {checkpoint_path}.')
@@ -150,6 +158,7 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
             exit()
     if checkpoint_cleanspecnet_path is not None:
         if os.path.exists(checkpoint_cleanspecnet_path):
+            print("Loading checkpoint '{}'".format(checkpoint_cleanspecnet_path))
             checkpoint_dict = torch.load(checkpoint_cleanspecnet_path, map_location='cpu')    
             new_checkpoint_dict = {}
             for k, v in checkpoint_dict['state_dict'].items():
@@ -179,7 +188,6 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
         mrstftloss = None
 
     loss_fn = CleanUNet2Loss(**loss_config, mrstftloss=mrstftloss)
-
 
     epoch = 1
     print("Starting training...")
