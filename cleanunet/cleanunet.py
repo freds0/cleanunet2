@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from util import weight_scaling_init
+from .util import weight_scaling_init
 
 #torch.autograd.set_detect_anomaly(True)
 

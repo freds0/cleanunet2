@@ -1,290 +1,357 @@
-import argparse
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from distributed import init_distributed, apply_gradient_allreduce, reduce_tensor
-from dataset import load_cleanunet2_dataset
-from util import print_size
-from util import LinearWarmupCosineDecay, save_checkpoint, load_checkpoint, prepare_directories_and_logger
-from models import CleanUNet2
-from stft_loss import MultiResolutionSTFTLoss, CleanUnetLoss, CleanUNet2Loss
-import json
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+import itertools
 import os
-import random
-import numpy as np
+import time
+import argparse
+import json
+import torch
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DistributedSampler, DataLoader
+import torch.multiprocessing as mp
+from torch.distributed import init_process_group
+from torch.nn.parallel import DistributedDataParallel
+import torchaudio.transforms as T
+from env import AttrDict, build_env
+#from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
+from spec_dataset import MelDataset, mel_spectrogram, get_dataset_filelist
+from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
+    discriminator_loss
+from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+import torchaudio
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-plt.ioff()
+from cleanunet import CleanUNet2
 
-random.seed(0)
-torch.manual_seed(0)
-np.random.seed(0)
+torch.backends.cudnn.benchmark = True
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print("Running on device: {}".format(device))
+'''
+def pad_spectrogram(spec1, spec2):
+    # Source: https://github.com/jik876/hifi-gan/issues/52
+    if spec1.size(2) > spec2.size(2):
+        spec2 = torch.nn.functional.pad(spec2, (0, spec1.size(2) - spec2.size(2)), 'constant')
+    elif spec1.size(2) < spec2.size(2):
+        spec1 = torch.nn.functional.pad(spec1, (0, spec2.size(2) - spec1.size(2)), 'constant')
+    return spec1, spec2
+'''
+def pad_spectrogram(spec1, spec2):
+    # Garantir que os tensores tenham 3 dimensões
+    if len(spec1.size()) < 3 or len(spec2.size()) < 3:
+        raise ValueError("Espectrogramas esperados com pelo menos 3 dimensões, mas recebidos: spec1.size={} e spec2.size={}".format(spec1.size(), spec2.size()))
+
+    # Source: https://github.com/jik876/hifi-gan/issues/52
+    if spec1.size(2) > spec2.size(2):
+        spec2 = torch.nn.functional.pad(spec2, (0, spec1.size(2) - spec2.size(2)), 'constant')
+    elif spec1.size(2) < spec2.size(2):
+        spec1 = torch.nn.functional.pad(spec1, (0, spec2.size(2) - spec1.size(2)), 'constant')
+    return spec1, spec2
 
 
-def validate(model, val_loader, loss_fn, iteration, trainset_config, logger, device):
+def load_checkpoint(checkpoint_path, model):
+    assert os.path.isfile(checkpoint_path)
+    print("Loading checkpoint '{}'".format(checkpoint_path))
+    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')    
+    print(checkpoint_dict.keys())
+    model.load_state_dict(checkpoint_dict['state_dict'])
+    return model
 
-    model.eval()
-    val_loss = 0.0
-    num_batches = 0
 
+def pad_waveform(wav1, wav2):
+    if wav1.size(2) > wav2.size(2):
+        wav2 = torch.nn.functional.pad(wav2, (0, wav1.size(2) - wav2.size(2)), 'constant')
+    elif wav1.size(2) < wav2.size(2):
+        wav1 = torch.nn.functional.pad(wav1, (0, wav2.size(2) - wav1.size(2)), 'constant')
+    return wav1, wav2
+
+
+spectrogram_fn = T.Spectrogram(n_fft=1024, hop_length=256, win_length=1024, power=1.0, normalized=True, center=False).to(device)
+
+def validation(generator, validation_loader, sw, h, steps, device, first=False):
+    generator.eval()
+    torch.cuda.empty_cache()
+    val_err_tot = 0
     with torch.no_grad():
+        for j, batch in enumerate(validation_loader):
+            x_audio, x_spec, y_audio, y_spec = batch
+            x_audio, x_spec, y_audio, y_spec = x_audio.to(device), x_spec.to(device), y_audio.to(device), y_spec.to(device)
+            y_g_hat = generator(x_audio, x_spec)
+            y_g_hat_spec = spectrogram_fn(y_g_hat.squeeze(1))#.squeeze()
+            # FRED: upsampling
+            y_spec, y_g_hat_spec = pad_spectrogram(y_spec, y_g_hat_spec)
+            val_err_tot += F.l1_loss(y_spec, y_g_hat_spec).item()
 
-        for i, (clean_audio, clean_spec, noisy_audio, noisy_spec) in enumerate(val_loader):
-            clean_audio, clean_spec = clean_audio.to(device), clean_spec.to(device)
-            noisy_audio, noisy_spec = noisy_audio.to(device), noisy_spec.to(device)
+            if j <= 4:
+                if steps == 0 or first:
+                    y_spec = mel_spectrogram(y_audio[0].squeeze(1), h.n_fft, h.num_mels,
+                                                    h.sampling_rate, h.hop_size, h.win_size,
+                                                    h.fmin, h.fmax)                    
+                    sw.add_audio('target/y_{}'.format(j), y_audio[0], steps, h.sampling_rate)
+                    sw.add_figure('target/y_spec_{}'.format(j), plot_spectrogram(y_spec.squeeze(0).to('cpu')), steps)
 
-            denoised_audio, denoised_spec = model(noisy_audio, noisy_spec)  
-
-            loss = loss_fn(clean_audio, denoised_audio)
-
-            val_loss += loss
-            num_batches += 1
-
-        val_loss /= num_batches
-
-    model.train()
-
-    #if rank == 0 and logger is not None:
-    if logger is not None:
-        print(f"Validation loss at iteration {iteration}: {val_loss:.6f}")
-
-        # save to tensorboard
-        logger.add_scalar("Validation/Loss", val_loss, iteration)
-
-        num_samples = min(4, clean_spec.size(0))
-
-        for i in range(num_samples):
-            # Get spectrograms
-            clean_spec_i = clean_spec[i].squeeze()  # Shape: (freq_bins, time_steps)
-            denoised_spec_i = denoised_spec[i].squeeze()
-            noisy_spec_i = noisy_spec[i].squeeze()
-
-            # Convert spectrograms to numpy arrays for plotting
-            clean_spec_np = clean_spec_i.cpu().numpy()
-            denoised_spec_np = denoised_spec_i.cpu().detach().numpy()
-            noisy_spec_np = noisy_spec_i.cpu().numpy()
-
-            clean_audio_i = clean_audio[i].squeeze()
-            denoised_audio_i = denoised_audio[i].squeeze()
-            noisy_audio_i = noisy_audio[i].squeeze()
-
-            clean_audio_np = clean_audio_i.cpu().numpy()
-            denoised_audio_np = denoised_audio_i.cpu().numpy()
-            noisy_audio_np = noisy_audio_i.cpu().numpy()                      
-            
-            # Plot spectrograms
-            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-            axs[0].imshow(clean_spec_np, origin='lower', aspect='auto')
-            axs[0].set_title('Clean Spectrogram')
-            axs[1].imshow(denoised_spec_np, origin='lower', aspect='auto')
-            axs[1].set_title('Denoised Spectrogram')
-            axs[2].imshow(noisy_spec_np, origin='lower', aspect='auto')
-            axs[2].set_title('Noisy Spectrogram')
-            plt.tight_layout()
-            logger.add_figure('Spectrograms/Sample_{}'.format(i), fig, iteration)
-            plt.close(fig)
-
-            # Log audio samples to TensorBoard
-            sample_rate = trainset_config['sample_rate']
-            logger.add_audio('Audio/Clean_{}'.format(i), clean_audio_np, iteration, sample_rate=sample_rate)
-            logger.add_audio('Audio/Denoised_{}'.format(i), denoised_audio_np, iteration, sample_rate=sample_rate)
-            logger.add_audio('Audio/Noisy_{}'.format(i), noisy_audio_np, iteration, sample_rate=sample_rate)
+                sw.add_audio('denoised/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
+                y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
+                                                h.sampling_rate, h.hop_size, h.win_size,
+                                                h.fmin, h.fmax)
+                sw.add_figure('denoised/y_hat_spec_{}'.format(j),
+                                plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
 
 
-def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_cleanunet_path, checkpoint_cleanspecnet_path, log, optimization, loss_config=None, device=None):
-    device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                sw.add_audio('noisy/x_{}'.format(j), x_audio[0], steps, h.sampling_rate)
+                x_hat_spec = mel_spectrogram(x_audio.squeeze(1), h.n_fft, h.num_mels,
+                                                h.sampling_rate, h.hop_size, h.win_size,
+                                                h.fmin, h.fmax)
+                sw.add_figure('noisy/x_spec_{}'.format(j),
+                                plot_spectrogram(x_hat_spec.squeeze(0).cpu().numpy()), steps)
+        val_err = val_err_tot / (j+1)
 
-    # Create tensorboard logger.
-    output_dir = os.path.join(log["directory"], exp_path)
-    log_directory = os.path.join(output_dir, 'logs')
-    ckpt_dir = os.path.join(output_dir, 'checkpoint')
+        sw.add_scalar("validation/mel_spec_error", val_err, steps)
 
-    weight_decay = optimization["weight_decay"]
-    learning_rate =  optimization["learning_rate"]
-    max_norm = optimization["max_norm"]
-    batch_size = optimization["batch_size_per_gpu"]
-    iters_per_valid = log["iters_per_valid"]
-    iters_per_ckpt = log["iters_per_ckpt"]
+    generator.train()
 
-    logger = prepare_directories_and_logger(
-        output_dir, log_directory, ckpt_dir, rank=0)
 
-    # distributed running initialization
-    if num_gpus > 1:
-        init_distributed(rank, num_gpus, group_name, **dist_config)   
+def train(rank, a, h):
+    if h.num_gpus > 1:
+        init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
+                           world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
 
-    trainloader, testloader = load_cleanunet2_dataset(**trainset_config, 
-                                batch_size=batch_size, 
-                                num_gpus=1)
-    print('Data loaded')
-    # initialize the model
-    model = CleanUNet2(**network_config).to(device)
-    model.train()
+    torch.cuda.manual_seed(h.seed)
+    device = torch.device('cuda:{:d}'.format(rank))
 
-    for param in model.clean_spec_net.parameters():
-        param.requires_grad = False
+    generator = CleanUNet2(**h.cleanunet2_config).to(device)
 
-    #for param in model.clean_unet.parameters():
-    #    param.requires_grad = False
-    #             
-    print_size(model)
+    mpd = MultiPeriodDiscriminator().to(device)
+    msd = MultiScaleDiscriminator().to(device)
 
-    # apply gradient all reduce
-    if num_gpus > 1:
-        model = apply_gradient_allreduce(model)
-
-    # define optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-    # load checkpoint
-    global_step = 0
-    if checkpoint_path is not None:
-        if os.path.exists(checkpoint_path):
-            print("Loading checkpoint '{}'".format(checkpoint_path))
-            model, optimizer, learning_rate, iteration = load_checkpoint(checkpoint_path, model, optimizer)
-            global_step = iteration + 1
-        else:
-            print(f'No valid checkpoint model found at {checkpoint_path}.')
-            exit()
-    if checkpoint_cleanunet_path is not None:
-        if os.path.exists(checkpoint_cleanunet_path):
-            print("Loading checkpoint '{}'".format(checkpoint_cleanunet_path))
-            checkpoint_dict = torch.load(checkpoint_cleanunet_path, map_location='cpu')    
-            new_checkpoint_dict = {}
-            for k, v in checkpoint_dict['model_state_dict'].items():
-                k = "clean_unet." + k
-                new_checkpoint_dict[k] = v
-            model.load_state_dict(new_checkpoint_dict, strict=False)
-        else:
-            print(f'No valid checkpoint model found at {checkpoint_cleanunet_path}.')
-            exit()
-    if checkpoint_cleanspecnet_path is not None:
-        if os.path.exists(checkpoint_cleanspecnet_path):
-            print("Loading checkpoint '{}'".format(checkpoint_cleanspecnet_path))
-            checkpoint_dict = torch.load(checkpoint_cleanspecnet_path, map_location='cpu')    
-            new_checkpoint_dict = {}
-            for k, v in checkpoint_dict['state_dict'].items():
-                k = "clean_spec_net." + k
-                new_checkpoint_dict[k] = v
-            model.load_state_dict(new_checkpoint_dict, strict=False)
-
-        else:
-            print(f'No valid checkpoint model found at {checkpoint_cleanspecnet_path}.')
-            exit()
-
-    # define learning rate scheduler
-    scheduler = LinearWarmupCosineDecay(
-                    optimizer,
-                    lr_max=learning_rate,
-                    n_iter=optimization["n_iters"],
-                    iteration=global_step,
-                    divider=25,
-                    warmup_proportion=0.01,
-                    phase=('linear', 'cosine'),
-                )
-
-    # define multi resolution stft loss
-    if loss_config["stft_lambda"] > 0:
-        mrstftloss = MultiResolutionSTFTLoss(**loss_config["stft_config"]).to(device)
-    else:
-        mrstftloss = None
-
-    loss_fn = CleanUNet2Loss(**loss_config, mrstftloss=mrstftloss)
-
-    epoch = 1
-    print("Starting training...")
-    while global_step < optimization["n_iters"] + 1:    
-        # for each epoch
-        for step, (clean_audio, clean_spec, noisy_audio, noisy_spec) in enumerate(trainloader):
-
-            noisy_audio = noisy_audio.to(device)
-            noisy_spec = noisy_spec.to(device)
-            clean_audio = clean_audio.to(device)
-            clean_spec = clean_spec.to(device)
-
-            optimizer.zero_grad()
-            # forward propagation
-            denoised_audio, denoised_spec = model(noisy_audio, noisy_spec)
-            # calculate loss
-            loss = loss_fn(clean_audio, denoised_audio)
-            if num_gpus > 1:
-                reduced_loss = reduce_tensor(loss.data, num_gpus).item()
-            else:
-                reduced_loss = loss.item()            
-               
-            # back-propagation
-            loss.backward()
-            # gradient clipping
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            # update learning rate
-            scheduler.step()            
-            # update model parameters
-            optimizer.step()
-
-            print(f"Epoch: {epoch:<5} step: {step:<6} global step {global_step:<7} loss: {loss.item():.7f}", flush=True)
-
-            if global_step > 0 and global_step % 10 == 0: 
-                # save to tensorboard
-                logger.add_scalar("Train/Train-Loss", reduced_loss, global_step)
-                #logger.add_scalar("Train/Train-Reduced-Loss", reduced_loss, global_step)
-                logger.add_scalar("Train/Gradient-Norm", grad_norm, global_step)
-                logger.add_scalar("Train/learning-rate", optimizer.param_groups[0]["lr"], global_step)
-
-            if global_step > 0 and global_step % iters_per_valid == 0 and rank == 0:
-                validate(model, testloader, loss_fn, global_step, trainset_config, logger, device)
-                
-            # save checkpoint
-            if global_step > 0 and global_step % iters_per_ckpt == 0 and rank == 0:
-                checkpoint_name = '{}.pkl'.format(global_step)
-                checkpoint_path = os.path.join(ckpt_dir, checkpoint_name)
-                save_checkpoint(model, optimizer, learning_rate, global_step, checkpoint_path)
-                print('model at iteration %s is saved' % global_step)
-            global_step += 1
-        
-        epoch += 1
-
-    # After training, close TensorBoard.
     if rank == 0:
-        logger.close()
+        print(generator)
+        os.makedirs(a.checkpoint_path, exist_ok=True)
+        print("checkpoints directory : ", a.checkpoint_path)
 
-    return 0
+    if os.path.isdir(a.checkpoint_path):
+        cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
+        cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
+
+    steps = 0
+    if cp_g is None or cp_do is None:
+        state_dict_do = None
+        last_epoch = -1
+    else:
+        state_dict_g = load_checkpoint(cp_g, device)
+        state_dict_do = load_checkpoint(cp_do, device)
+        generator.load_state_dict(state_dict_g['generator'])
+        mpd.load_state_dict(state_dict_do['mpd'])
+        msd.load_state_dict(state_dict_do['msd'])
+        steps = state_dict_do['steps'] + 1
+        last_epoch = state_dict_do['epoch']
+
+    if h.num_gpus > 1:
+        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
+        mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
+        msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
+
+    optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
+                                h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+
+    if state_dict_do is not None:
+        optim_g.load_state_dict(state_dict_do['optim_g'])
+        optim_d.load_state_dict(state_dict_do['optim_d'])
+
+    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
+    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
+
+    training_filelist, validation_filelist = get_dataset_filelist(a)
+
+    trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
+                          h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
+                          shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
+                          base_mels_path=a.input_mels_dir, noise_addition=h.noise_addition, config_noise_aug=h.noise_aug_params, augmentations=h.augmentations)    
+
+    train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
+
+    train_loader = DataLoader(trainset, num_workers=h.num_workers, shuffle=False,
+                              sampler=train_sampler,
+                              batch_size=h.batch_size,
+                              pin_memory=True,
+                              drop_last=True)
+
+    if rank == 0:
+        validset = MelDataset(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
+                              h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
+                              fmax_loss=h.fmax_for_loss, device=device,
+                              base_mels_path=a.input_mels_dir, augmentations=h.augmentations)
+        validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
+                                       sampler=None,
+                                       batch_size=1,
+                                       pin_memory=True,
+                                       drop_last=True)
+
+        sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
+        # first validation when start the train
+        #validation(generator, validation_loader, sw, h, steps, device, first=True)
+
+    '''
+    checkpoint_path = "checkpoints/40000.pkl"
+    try:
+        generator = load_checkpoint(checkpoint_path, generator)
+    except:
+        print("Error loading generator checkpoint")
+        exit()
+    else:
+        print(f"Generator checkpoint {checkpoint_path} loaded successfully")
+    '''
+    generator.train()
+    mpd.train()
+    msd.train()    
+
+    for epoch in range(max(0, last_epoch), a.training_epochs):
+        if rank == 0:
+            start = time.time()
+            print("Epoch: {}".format(epoch+1))
+
+        if h.num_gpus > 1:
+            train_sampler.set_epoch(epoch)
+
+        for i, batch in enumerate(train_loader):
+            if rank == 0:
+                start_b = time.time()
+            
+            x_audio, x_spec, y_audio, y_spec = batch 
+            # x_audio : (batch_size, 1, segment_size)
+            # x_spec : (batch_size, fft, segment_size)
+            # y_audio : (batch_size, 1, segment_size)
+            # y_spec : (batch_size, fft, segment_size)
+
+            x_audio, x_spec, y_audio, y_spec = x_audio.to(device), x_spec.to(device), y_audio.to(device), y_spec.to(device)
+
+            y_g_hat = generator(x_audio, x_spec) # (batch_size, 1, segment_size)
+            y_g_hat_spec = spectrogram_fn(y_g_hat).squeeze() # (batch_size, fft, segment_size)
+
+            optim_d.zero_grad()
+
+            # MPD
+            y_g_hat = y_g_hat.view(y_audio.size(0), 1, -1)
+            y_df_hat_r, y_df_hat_g, _, _ = mpd(y_audio, y_g_hat.detach())
+            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+
+            # MSD
+            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y_audio, y_g_hat.detach())
+            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
+
+            loss_disc_all = loss_disc_s + loss_disc_f
+
+            loss_disc_all.backward()
+            optim_d.step()
+
+            # Generator
+            optim_g.zero_grad()
+
+            # FRED: Padding mel-spectrograms
+            #y_spec, y_g_hat_spec = pad_spectrogram(y_spec, y_g_hat_spec)
+
+            # L1 Mel-Spectrogram Loss
+
+            loss_spec = F.l1_loss(y_spec, y_g_hat_spec) * 45
+
+            # FRED
+            y_audio, y_g_hat = pad_waveform(y_audio, y_g_hat)
+
+            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y_audio, y_g_hat)
+            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y_audio, y_g_hat)
+            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_spec
+
+            loss_gen_all.backward()
+            optim_g.step()
+
+            if rank == 0:
+                # STDOUT logging
+                if steps % a.stdout_interval == 0:
+                    with torch.no_grad():
+                        spec_error = F.l1_loss(y_spec, y_g_hat_spec).item()
+
+                    print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
+                          format(steps, loss_gen_all, spec_error, time.time() - start_b))
+
+                # checkpointing
+                if steps % a.checkpoint_interval == 0 and steps != 0:
+                    checkpoint_path = "{}/g_{:08d}".format(a.checkpoint_path, steps)
+                    save_checkpoint(checkpoint_path,
+                                    {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
+                    checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
+                    save_checkpoint(checkpoint_path,
+                                    {'mpd': (mpd.module if h.num_gpus > 1
+                                                         else mpd).state_dict(),
+                                     'msd': (msd.module if h.num_gpus > 1
+                                                         else msd).state_dict(),
+                                     'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
+                                     'epoch': epoch})
+
+                # Tensorboard summary logging
+                if steps % a.summary_interval == 0:
+                    sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
+                    sw.add_scalar("training/mel_spec_error", spec_error, steps)
+
+                # Validation
+                if steps % a.validation_interval == 0:  # and steps != 0:
+                    validation(generator, validation_loader, sw, h, steps, device)
+                    generator.train()
+
+            steps += 1
+
+        scheduler_g.step()
+        scheduler_d.step()
+
+        if rank == 0:
+            print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
+
+
+def main():
+    print('Initializing Training Process..')
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--group_name', default=None)
+    parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs')
+    parser.add_argument('--input_mels_dir', default='ft_dataset')
+    parser.add_argument('--input_training_file', default='./filelists/ljs_audio_text_train_filelist.txt')
+    parser.add_argument('--input_validation_file', default='./filelists/ljs_audio_text_val_filelist.txt')
+    parser.add_argument('--checkpoint_path', default='logs_tacotron')
+    parser.add_argument('--config', default='')
+    parser.add_argument('--training_epochs', default=9000, type=int)
+    parser.add_argument('--stdout_interval', default=5, type=int)
+    parser.add_argument('--checkpoint_interval', default=5000, type=int)
+    parser.add_argument('--summary_interval', default=100, type=int)
+    parser.add_argument('--validation_interval', default=1000, type=int)
+
+    a = parser.parse_args()
+
+    with open(a.config) as f:
+        data = f.read()
+
+    json_config = json.loads(data)
+    h = AttrDict(json_config)
+    build_env(a.config, 'config.json', a.checkpoint_path)
+
+    torch.manual_seed(h.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(h.seed)
+        h.num_gpus = torch.cuda.device_count()
+        h.batch_size = int(h.batch_size / h.num_gpus)
+        print('Batch size per GPU :', h.batch_size)
+    else:
+        pass
+
+    if h.num_gpus > 1:
+        mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))
+    else:
+        train(0, a, h)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--config', type=str, default='configs/config.json', 
-                        help='JSON file for configuration')
-    parser.add_argument('-r', '--rank', type=int, default=0,
-                        help='rank of process for distributed')
-    parser.add_argument('-g', '--group_name', type=str, default='',
-                        help='name of group for distributed')
-    args = parser.parse_args()
-
-    with open("configs/config.json") as f:
-        data = f.read()
-    config = json.loads(data)
-
-    train_config            = config["train_config"]        # training parameters
-    global dist_config
-    dist_config             = config["dist_config"]         # to initialize distributed training
-    global network_config
-    network_config          = config["network_config"]      # to define network
-    global trainset_config
-    trainset_config         = config["trainset_config"]     # to load trainset
-
-    num_gpus = torch.cuda.device_count()
-    if num_gpus > 1:
-        if args.group_name == '':
-            print("WARNING: Multiple GPUs detected but no distributed group set")
-            print("Only running 1 GPU. Use distributed.py for multiple GPUs")
-            num_gpus = 1
-
-    if num_gpus == 1 and args.rank != 0:
-        raise Exception("Doing single GPU training on rank > 0")
-    
-    #torch.backends.cudnn.enabled = True
-    #torch.backends.cudnn.benchmark = True
-
-    train(num_gpus, args.rank, args.group_name, **train_config)
+    main()

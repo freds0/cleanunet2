@@ -37,8 +37,11 @@ class AudioAugmenter:
         return Compose(aug_list)
 
     def apply(self, waveform, sr):
-        augmented_waveform = self.compose(samples=waveform, sample_rate=sr)
-        return augmented_waveform
+        #print(waveform.shape)
+        waveform = waveform.squeeze()
+        aug_waveform = self.compose(samples=waveform, sample_rate=sr)
+        aug_waveform = aug_waveform.reshape(1, -1)         
+        return aug_waveform
 
 def main():
     parser = argparse.ArgumentParser()
