@@ -81,21 +81,22 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
     return spec
 
 
-def get_dataset_filelist(a):
-    with open(a.input_training_file, 'r', encoding='utf-8') as fi:
-        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0])
+def get_dataset_filelist(train_file, val_file):
+    with open(train_file, 'r', encoding='utf-8') as fi:
+        training_files = [x.split('|')[0]
                           for x in fi.read().split('\n') if len(x) > 0]
 
-    with open(a.input_validation_file, 'r', encoding='utf-8') as fi:
-        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0])
+    with open(val_file, 'r', encoding='utf-8') as fi:
+        validation_files = [x.split('|')[0]
                             for x in fi.read().split('\n') if len(x) > 0]
     return training_files, validation_files
 
 
 class MelDataset(torch.utils.data.Dataset):
-    def __init__(self, training_files, segment_size, n_fft, num_mels,
+    def __init__(self, data_dir, training_files, segment_size, n_fft, num_mels,
                  hop_size, win_size, sampling_rate, fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
-                 device=None, fmax_loss=None, base_mels_path=None, use_interpolation=True, noise_addition=False, config_noise_aug=None, augmentations=None):
+                 device=None, fmax_loss=None, noise_addition=False, augmentations=None):
+        self.data_dir = data_dir
         self.audio_files = training_files
         random.seed(1234)
         if shuffle:
@@ -111,29 +112,21 @@ class MelDataset(torch.utils.data.Dataset):
         self.fmax = fmax
         self.fmax_loss = fmax_loss
         self.noise_addition = noise_addition
-        #if noise_addition:
-        #    self.noise_adder = NoiseAugmentation(sr=self.input_sampling_rate, **config_noise_aug)
-        #else:
-        #    self.noise_adder = None
-        #self.noise_adder = None
 
         # Initialize the AudioAugmenter with the provided augmentations, if any
-        print("Augmentations:", augmentations)
-        self.audio_augmenter = AudioAugmenter(augmentations) if augmentations else None
-        print("Using audio augmentations")
+        if augmentations:
+            self.audio_augmenter = AudioAugmenter(augmentations) if augmentations else None
+            print("Using audio augmentations")
 
-        if self.audio_augmenter:
-            print("Using audio augmentations")        
         self.cached_wav = None
         self.cached_wav_input = None
         self.n_cache_reuse = n_cache_reuse
         self._cache_ref_count = 0
         self.device = device
-        self.base_mels_path = base_mels_path
         self.spectrogram_fn = T.Spectrogram(n_fft=1024, hop_length=256, win_length=1024, power=1.0, normalized=True, center=False)
         
     def __getitem__(self, index):
-        filename = self.audio_files[index]
+        filename = os.path.join(self.data_dir, self.audio_files[index])
 
         if self._cache_ref_count == 0:
             try:
@@ -146,16 +139,6 @@ class MelDataset(torch.utils.data.Dataset):
                 print(e)
                 return self.__getitem__(random.randint(0, self.__len__()))
             
-            '''
-            if self.noise_addition:
-                noised_audio = self.noise_adder.augment(clean_audio.clone()).unsqueeze(0)
-                input_audio = noised_audio
-
-                if not noised_audio.size(1) == clean_audio.size(1):
-                    torchaudio.save('noised_audio.wav', noised_audio, self.input_sampling_rate)
-                    torchaudio.save('clean_audio.wav', clean_audio, self.input_sampling_rate)
-                assert noised_audio.size(1) == clean_audio.size(1), "Noised audio and clean audio must have the same length"
-            '''
             if sampling_rate != self.sampling_rate:
                 raise ValueError("{} Sampling_rate doesn't match target {} sampling_rate".format(
                     sampling_rate, self.sampling_rate))
@@ -174,19 +157,6 @@ class MelDataset(torch.utils.data.Dataset):
 
             input_audio = noisy_audio
 
-            '''
-            if (self.result_sampling_rate != self.input_sampling_rate) and (not self.mel_spec_fine_tuning):
-                audio_frames = input_audio.size(1) 
-                # if odd turn even
-                if audio_frames % 2 != 0:
-                    input_audio = input_audio[:, :audio_frames-1]
-                    clean_audio = clean_audio[:, :audio_frames-1]
-
-                # resample input sample to TTS sampling_rate
-                input_audio = self.audio_resample(input_audio)
-            else:
-                input_audio = None
-            '''
             self.cached_clean_wav = clean_audio
             self.cached_input_wav = input_audio
 
@@ -195,7 +165,6 @@ class MelDataset(torch.utils.data.Dataset):
             clean_audio = self.cached_clean_wav
             input_audio = self.cached_input_wav
             self._cache_ref_count -= 1
-
 
         # split audio into segments
         if self.split:

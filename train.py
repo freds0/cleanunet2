@@ -18,8 +18,7 @@ from env import AttrDict, build_env
 from spec_dataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
-from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
-import torchaudio
+from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint, print_size, load_submodel_checkpoint
 
 from cleanunet import CleanUNet2
 
@@ -115,6 +114,10 @@ def train(rank, a, h):
     if h.num_gpus > 1:
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
                            world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
+        
+    checkpoint_path              = h.checkpoint_path
+    checkpoint_cleanunet_path    = h.checkpoint_cleanunet_path
+    checkpoint_cleanspecnet_path = h.checkpoint_cleanspecnet_path
 
     torch.cuda.manual_seed(h.seed)
     device = torch.device('cuda:{:d}'.format(rank))
@@ -124,8 +127,27 @@ def train(rank, a, h):
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
+    # load partial checkpoint models
     if rank == 0:
-        print(generator)
+        if checkpoint_cleanunet_path is not None:
+            try:
+                print("Loading checkpoint '{}'".format(checkpoint_cleanunet_path))
+                generator = load_submodel_checkpoint(generator, checkpoint_cleanunet_path, pre_name="clean_unet.")
+            except Exception as e:
+                print(e)
+            else:
+                print("Checkpoint loaded")
+
+        if checkpoint_cleanspecnet_path is not None:
+            try:
+                print("Loading checkpoint '{}'".format(checkpoint_cleanspecnet_path))
+                generator = load_submodel_checkpoint(generator, checkpoint_cleanspecnet_path, pre_name="clean_spec_net.")            
+            except Exception as e:
+                print(e)
+            else:
+                print("Checkpoint loaded")
+
+
         os.makedirs(a.checkpoint_path, exist_ok=True)
         print("checkpoints directory : ", a.checkpoint_path)
 
@@ -146,6 +168,15 @@ def train(rank, a, h):
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
 
+    if h.freeze_cleanspecnet:
+        for param in generator.clean_spec_net.parameters():
+            param.requires_grad = False
+
+    if h.freeze_cleanunet:
+        for param in generator.clean_unet.parameters():
+            param.requires_grad = False
+             
+
     if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
@@ -162,12 +193,12 @@ def train(rank, a, h):
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
 
-    training_filelist, validation_filelist = get_dataset_filelist(a)
+    training_filelist, validation_filelist = get_dataset_filelist(h.train_metadata, h.test_metadata)
 
-    trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
+    trainset = MelDataset(h.data_dir, training_filelist, h.segment_size, h.n_fft, h.num_mels,
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
-                          shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
-                          base_mels_path=a.input_mels_dir, noise_addition=h.noise_addition, config_noise_aug=h.noise_aug_params, augmentations=h.augmentations)    
+                          shuffle=True if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
+                          augmentations=h.augmentations)    
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
 
@@ -178,10 +209,10 @@ def train(rank, a, h):
                               drop_last=True)
 
     if rank == 0:
-        validset = MelDataset(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
+        validset = MelDataset(h.data_dir, validation_filelist, h.segment_size, h.n_fft, h.num_mels,
                               h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
                               fmax_loss=h.fmax_for_loss, device=device,
-                              base_mels_path=a.input_mels_dir, augmentations=h.augmentations)
+                              augmentations=h.augmentations)
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
                                        sampler=None,
                                        batch_size=1,
@@ -192,16 +223,8 @@ def train(rank, a, h):
         # first validation when start the train
         #validation(generator, validation_loader, sw, h, steps, device, first=True)
 
-    '''
-    checkpoint_path = "checkpoints/40000.pkl"
-    try:
-        generator = load_checkpoint(checkpoint_path, generator)
-    except:
-        print("Error loading generator checkpoint")
-        exit()
-    else:
-        print(f"Generator checkpoint {checkpoint_path} loaded successfully")
-    '''
+    print_size(generator)
+
     generator.train()
     mpd.train()
     msd.train()    
@@ -243,6 +266,8 @@ def train(rank, a, h):
             loss_disc_all = loss_disc_s + loss_disc_f
 
             loss_disc_all.backward()
+
+            # Discriminator
             optim_d.step()
 
             # Generator
@@ -267,6 +292,10 @@ def train(rank, a, h):
             loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_spec
 
             loss_gen_all.backward()
+
+            grad_norm_g = torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
+            grad_norm_d = torch.nn.utils.clip_grad_norm_(itertools.chain(msd.parameters(), mpd.parameters()), 1.0)
+
             optim_g.step()
 
             if rank == 0:
@@ -296,6 +325,10 @@ def train(rank, a, h):
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
                     sw.add_scalar("training/mel_spec_error", spec_error, steps)
+                    sw.add_scalar("training/gradient_norm_g", grad_norm_g, steps)
+                    sw.add_scalar("training/gradient_norm_d", grad_norm_d, steps)
+                    sw.add_scalar("training/lr_gen", optim_g.param_groups[0]["lr"], steps)
+                    sw.add_scalar("training/lr_dis", optim_d.param_groups[0]["lr"], steps)
 
                 # Validation
                 if steps % a.validation_interval == 0:  # and steps != 0:
@@ -317,13 +350,11 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--group_name', default=None)
-    parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs')
-    parser.add_argument('--input_mels_dir', default='ft_dataset')
-    parser.add_argument('--input_training_file', default='./filelists/ljs_audio_text_train_filelist.txt')
-    parser.add_argument('--input_validation_file', default='./filelists/ljs_audio_text_val_filelist.txt')
-    parser.add_argument('--checkpoint_path', default='logs_tacotron')
-    parser.add_argument('--config', default='')
-    parser.add_argument('--training_epochs', default=9000, type=int)
+    #parser.add_argument('--input_training_file', default='./filelists/ljs_audio_text_train_filelist.txt')
+    #parser.add_argument('--input_validation_file', default='./filelists/ljs_audio_text_val_filelist.txt')
+    parser.add_argument('--checkpoint_path', default='logs_training')
+    parser.add_argument('--config', default='configs/config.json')
+    parser.add_argument('--training_epochs', default=1000, type=int)
     parser.add_argument('--stdout_interval', default=5, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
