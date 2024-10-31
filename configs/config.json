@@ -23,21 +23,23 @@
     },
     "train_config": {
         "exp_path": "cleanunet2",
-        "checkpoint_path": null,
-        "checkpoint_cleanunet_path": "./checkpoints/cleanunet/pretrained.pkl",
+        "checkpoint_path": "./checkpoints/cleanunet2/90000.pkl",
+        "checkpoint_cleanunet_path": null,
         "checkpoint_cleanspecnet_path": null,
+        "freeze_cleanspecnet" : true,
+        "freeze_cleanunet" : false,        
         "log":{
             "directory": "./logs_training",
             "ckpt_iter": "max",
-            "iters_per_ckpt": 10000,
-            "iters_per_valid": 1000
+            "iters_per_ckpt": 1000,
+            "iters_per_valid": 500
         },
         "optimization":{
             "n_iters": 5e8,
             "learning_rate": 2e-4,
             "weight_decay": 1e-5,
             "max_norm": 5,            
-            "batch_size_per_gpu": 6
+            "batch_size_per_gpu": 8
         },
         "loss_config":{
             "ell_p": 1,
@@ -58,62 +60,47 @@
         "train_metadata": "./filelists/ljs_audio_text_train_filelist.txt",
         "test_metadata": "./filelists/ljs_audio_text_val_filelist.txt",
         "crop_length_sec": 5,
-        "sample_rate": 16000,
+        "sample_rate": 24000,
         "n_fft": 1024, 
         "hop_length": 256, 
         "win_length": 1024,
         "power": 1.0,
         "augmentations": [
             {
-                "name": "Mp3Compression",
-                "params": {
-                    "min_bitrate": 128,
-                    "max_bitrate": 192,
-                    "backend": "pydub",
-                    "p": 0.2
-                }
-            },
-            {
                 "name": "AddBackgroundNoise",
                 "params": {
-                    "sounds_path": "../../DATASETS/noises_links",
+                    "background_paths": "/home/fred/Projetos/DATASETS/noises/bbc_effects/BBC03_Household/",
                     "min_snr_in_db": 15.0,
                     "max_snr_in_db": 30.0,
-                    "p": 0.2
-                }
-            },   
-            {
-                "name": "AddGaussianSNR",
-                "params": {
-                    "min_snr_in_db": 15,
-                    "max_snr_in_db": 30,
-                    "p": 0.2
-                }
-            },
-            {
-                "name": "LowPassFilter",
-                "params": {
-                    "min_cutoff_freq": 4000,
-                    "max_cutoff_freq": 7000,
-                    "p": 0.2
-                }
-            },
-            {
-                "name": "HighPassFilter",
-                "params": {
-                    "min_cutoff_freq": 400,
-                    "max_cutoff_freq": 2000,
-                    "p": 0.2
+                    "p": 0.4
                 }
             },
             {
                 "name": "ApplyImpulseResponse",
                 "params": {
-                    "ir_path": "../../DATASETS/rirs_links/",
-                    "p": 0.2
+                    "ir_paths": "/home/fred/Projetos/DATASETS/RIRS_NOISES/real_rirs_isotropic_noises/",
+                    "p": 0.4
                 }
-            }              
-        ]                         
+            },   
+            {
+                "name": "Gain",
+                "params": {
+                    "min_gain_in_db": -18.0,
+                    "max_gain_in_db": 6.0,
+                    "p": 0.3
+                }             
+            },
+            {
+                "name": "AddColoredNoise",
+                "params": {
+                    "min_snr_in_db": 15.0,
+                    "max_snr_in_db": 30.0,
+                    "min_f_decay": -1.0,
+                    "max_f_decay": 1.0,
+                    "p": 0.3
+                }
+            }         
+        ]                        
     },
     "gen_config":{
         "output_directory": "./exp"

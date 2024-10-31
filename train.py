@@ -2,6 +2,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio.transforms as T
 from distributed import init_distributed, apply_gradient_allreduce, reduce_tensor
 from dataset import load_cleanunet2_dataset
 from util import print_size
@@ -21,7 +22,6 @@ plt.ioff()
 random.seed(0)
 torch.manual_seed(0)
 np.random.seed(0)
-
 
 def validate(model, val_loader, loss_fn, iteration, trainset_config, logger, device):
 
@@ -46,6 +46,15 @@ def validate(model, val_loader, loss_fn, iteration, trainset_config, logger, dev
 
     model.train()
 
+    mel_transform = T.MelSpectrogram(
+        sample_rate=trainset_config['sample_rate'],
+        n_fft=trainset_config['n_fft'],
+        win_length=trainset_config['win_length'],
+        hop_length=trainset_config['hop_length'],
+        n_mels=80
+    ).to(device)
+    amplitude_to_db = T.AmplitudeToDB(stype='power')
+        
     #if rank == 0 and logger is not None:
     if logger is not None:
         print(f"Validation loss at iteration {iteration}: {val_loss:.6f}")
@@ -56,24 +65,22 @@ def validate(model, val_loader, loss_fn, iteration, trainset_config, logger, dev
         num_samples = min(4, clean_spec.size(0))
 
         for i in range(num_samples):
-            # Get spectrograms
-            clean_spec_i = clean_spec[i].squeeze()  # Shape: (freq_bins, time_steps)
-            denoised_spec_i = denoised_spec[i].squeeze()
-            noisy_spec_i = noisy_spec[i].squeeze()
-
-            # Convert spectrograms to numpy arrays for plotting
-            clean_spec_np = clean_spec_i.cpu().numpy()
-            denoised_spec_np = denoised_spec_i.cpu().detach().numpy()
-            noisy_spec_np = noisy_spec_i.cpu().numpy()
-
             clean_audio_i = clean_audio[i].squeeze()
             denoised_audio_i = denoised_audio[i].squeeze()
             noisy_audio_i = noisy_audio[i].squeeze()
 
             clean_audio_np = clean_audio_i.cpu().numpy()
             denoised_audio_np = denoised_audio_i.cpu().numpy()
-            noisy_audio_np = noisy_audio_i.cpu().numpy()                      
+            noisy_audio_np = noisy_audio_i.cpu().numpy()
+
+            clean_spec = amplitude_to_db(mel_transform(clean_audio_i))
+            denoised_spec = amplitude_to_db(mel_transform(denoised_audio_i))
+            noisy_spec = amplitude_to_db(mel_transform(noisy_audio_i))
             
+            clean_spec_np = clean_spec.cpu().numpy()
+            denoised_spec_np = denoised_spec.cpu().numpy()
+            noisy_spec_np = noisy_spec.cpu().numpy()
+                                                  
             # Plot spectrograms
             fig, axs = plt.subplots(1, 3, figsize=(15, 5))
             axs[0].imshow(clean_spec_np, origin='lower', aspect='auto')
@@ -93,7 +100,7 @@ def validate(model, val_loader, loss_fn, iteration, trainset_config, logger, dev
             logger.add_audio('Audio/Noisy_{}'.format(i), noisy_audio_np, iteration, sample_rate=sample_rate)
 
 
-def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_cleanunet_path, checkpoint_cleanspecnet_path, log, optimization, loss_config=None, device=None):
+def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_cleanunet_path, checkpoint_cleanspecnet_path, log, optimization, freeze_cleanspecnet=False, freeze_cleanunet=False, loss_config=None, device=None):
     device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Create tensorboard logger.
@@ -123,14 +130,6 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
     model = CleanUNet2(**network_config).to(device)
     model.train()
 
-    for param in model.clean_spec_net.parameters():
-        param.requires_grad = False
-
-    #for param in model.clean_unet.parameters():
-    #    param.requires_grad = False
-    #             
-    print_size(model)
-
     # apply gradient all reduce
     if num_gpus > 1:
         model = apply_gradient_allreduce(model)
@@ -142,7 +141,6 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
     global_step = 0
     if checkpoint_path is not None:
         if os.path.exists(checkpoint_path):
-            print("Loading checkpoint '{}'".format(checkpoint_path))
             model, optimizer, learning_rate, iteration = load_checkpoint(checkpoint_path, model, optimizer)
             global_step = iteration + 1
         else:
@@ -173,6 +171,16 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
         else:
             print(f'No valid checkpoint model found at {checkpoint_cleanspecnet_path}.')
             exit()
+
+    if freeze_cleanspecnet:
+        for param in model.clean_spec_net.parameters():
+            param.requires_grad = False
+
+    if freeze_cleanunet:
+        for param in model.clean_unet.parameters():
+            param.requires_grad = False
+
+    print_size(model)
 
     # define learning rate scheduler
     scheduler = LinearWarmupCosineDecay(
@@ -228,7 +236,6 @@ def train(num_gpus, rank, group_name, exp_path, checkpoint_path, checkpoint_clea
             if global_step > 0 and global_step % 10 == 0: 
                 # save to tensorboard
                 logger.add_scalar("Train/Train-Loss", reduced_loss, global_step)
-                #logger.add_scalar("Train/Train-Reduced-Loss", reduced_loss, global_step)
                 logger.add_scalar("Train/Gradient-Norm", grad_norm, global_step)
                 logger.add_scalar("Train/learning-rate", optimizer.param_groups[0]["lr"], global_step)
 
