@@ -17,7 +17,7 @@ MAX_WAV_VALUE = 32768.0
 
 def load_wav(full_path, target_sr):
     #sampling_rate, data = read(full_path)
-    data, sampling_rate = load(full_path)
+    data, sampling_rate = load(full_path, normalize=True)
     if sampling_rate != target_sr:
         #data = librosa.resample(data, sampling_rate, target_sr)
         data = torchaudio.transforms.Resample(orig_freq=sampling_rate, new_freq=target_sr)(data)
@@ -113,9 +113,9 @@ class MelDataset(torch.utils.data.Dataset):
         self.fmax_loss = fmax_loss
         self.noise_addition = noise_addition
 
-        # Initialize the AudioAugmenter with the provided augmentations, if any
-        if augmentations:
-            self.audio_augmenter = AudioAugmenter(augmentations) if augmentations else None
+        # Initialize the AudioAugmenter with the provided augmentations, if any        
+        self.audio_augmenter = AudioAugmenter(augmentations) if augmentations else None
+        if self.audio_augmenter:
             print("Using audio augmentations")
 
         self.cached_wav = None
@@ -132,7 +132,8 @@ class MelDataset(torch.utils.data.Dataset):
             try:
                 #audio, sampling_rate = load_wav(filename)
                 clean_audio, sampling_rate = load_wav(filename, self.sampling_rate)
-                input_audio = clean_audio
+                clean_audio = clean_audio / clean_audio.abs().max()
+                input_audio = clean_audio / clean_audio.abs().max()
             except Exception as e:
                 # if file dont exist or is corrupted, select other sample
                 print("WARNING: The file", filename, "Don't exist or is corrupted, please check this. Selecting other sample ...")
@@ -145,12 +146,8 @@ class MelDataset(torch.utils.data.Dataset):
             
             # Apply audio augmentations if any
             if self.audio_augmenter:
-                # Convert the tensor to a NumPy array for augmentation
-                audio_np = clean_audio.numpy()
                 # Apply the augmentations
-                audio_np = self.audio_augmenter.apply(audio_np, self.sampling_rate)
-                # Convert back to a tensor
-                noisy_audio = torch.from_numpy(audio_np)
+                noisy_audio = self.audio_augmenter.apply(clean_audio, self.sampling_rate)
             else:
                 # If there are no augmentations, noisy audio is the same as clean audio.
                 noisy_audio = clean_audio.clone()

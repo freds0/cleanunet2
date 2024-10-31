@@ -21,11 +21,16 @@ from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator,
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint, print_size, load_submodel_checkpoint
 
 from cleanunet import CleanUNet2
+from losses import MultiResolutionSTFTLoss, CleanUnetLoss, CleanUNet2Loss
+
+import warnings
+warnings.filterwarnings("ignore", message=".*had to be resampled.*")
 
 torch.backends.cudnn.benchmark = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Running on device: {}".format(device))
+
 '''
 def pad_spectrogram(spec1, spec2):
     # Source: https://github.com/jik876/hifi-gan/issues/52
@@ -46,15 +51,6 @@ def pad_spectrogram(spec1, spec2):
     elif spec1.size(2) < spec2.size(2):
         spec1 = torch.nn.functional.pad(spec1, (0, spec2.size(2) - spec1.size(2)), 'constant')
     return spec1, spec2
-
-
-def load_checkpoint(checkpoint_path, model):
-    assert os.path.isfile(checkpoint_path)
-    print("Loading checkpoint '{}'".format(checkpoint_path))
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')    
-    print(checkpoint_dict.keys())
-    model.load_state_dict(checkpoint_dict['state_dict'])
-    return model
 
 
 def pad_waveform(wav1, wav2):
@@ -229,6 +225,18 @@ def train(rank, a, h):
     mpd.train()
     msd.train()    
 
+    # define multi resolution stft loss    
+    if h.loss_config['stft_lambda'] > 0:
+        mrstftloss = MultiResolutionSTFTLoss(
+                        **h.loss_config['stft_config']
+                     ).to(device)
+    else:
+        mrstftloss = None
+
+    loss_cleanunet_fn = CleanUNet2Loss(
+                            **h.loss_config,
+                            mrstftloss=mrstftloss)
+
     for epoch in range(max(0, last_epoch), a.training_epochs):
         if rank == 0:
             start = time.time()
@@ -278,10 +286,10 @@ def train(rank, a, h):
 
             # L1 Mel-Spectrogram Loss
 
-            loss_spec = F.l1_loss(y_spec, y_g_hat_spec) * 45
+            #loss_spec = F.l1_loss(y_spec, y_g_hat_spec) * 45
 
-            # FRED
-            y_audio, y_g_hat = pad_waveform(y_audio, y_g_hat)
+            #y_audio, y_g_hat = pad_waveform(y_audio, y_g_hat)            
+            loss_cleanunet = loss_cleanunet_fn(y_audio, y_g_hat)
 
             y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y_audio, y_g_hat)
             y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y_audio, y_g_hat)
@@ -289,7 +297,7 @@ def train(rank, a, h):
             loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
             loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
             loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_spec
+            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_cleanunet # + loss_spec
 
             loss_gen_all.backward()
 
