@@ -104,7 +104,7 @@ class CleanUNet2(nn.Module):
         return reconstructed_waveform
     
 
-    def forward(self, noisy_waveform, noisy_spectrogram):
+    def forward(self, noisy_waveform, noisy_spectrogram, xvector):
         #print("cleanunet: noisy_spectrogram.shape", noisy_spectrogram.shape)
         #print("cleanunet: noisy_waveform.shape", noisy_waveform.shape)
         denoised_spectrogram = self.clean_spec_net(noisy_spectrogram)
@@ -116,7 +116,7 @@ class CleanUNet2(nn.Module):
         concat_waveform = torch.cat((noisy_waveform, reconstructed_waveform), dim=1)
         #print("cleanunet: concat_waveform.shape", concat_waveform.shape)
         concat_waveform = self.WaveformConditioner(concat_waveform)
-        denoised_waveform = self.clean_unet(concat_waveform)
+        denoised_waveform = self.clean_unet(concat_waveform, xvector)
         #print(*[f"cleanunet: denoised_waveform.shape: {denoised_waveform.shape}"])
         return denoised_waveform #, denoised_spectrogram
 

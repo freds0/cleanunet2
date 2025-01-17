@@ -12,6 +12,7 @@ from env import AttrDict
 from meldataset import mel_spectrogram, MAX_WAV_VALUE, load_wav
 from models import Generator
 from glob import glob
+from speechbrain.inference.speaker import EncoderClassifier
 
 h = None
 device = None
@@ -67,17 +68,22 @@ def inference(a, device):
 
     generator.eval()
     generator.remove_weight_norm()
+    xvector_model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-xvect-voxceleb", savedir="pretrained_xvector_model/spkrec-xvect-voxceleb", run_opts={"device": "cpu"}).eval()
+
     with torch.no_grad():
         for i, filepath in enumerate(tqdm(filelist)):
             #wav, sr = load_wav(os.path.join(a.input_wavs_dir, filepath))
-            wav, sr = load_wav(filepath)
-            print(wav.shape)
-            if wav.shape[0] > 1:
-                wav = convert_stereo_to_mono(wav)
-            wav = wav.to(device)
+            x_audio, sr = load_wav(filepath)
 
-            x = get_mel(wav.to('cpu'), sr).to(device)
-            y_g_hat = generator(x)
+            if x_audio.shape[0] > 1:
+                x_audio = convert_stereo_to_mono(x_audio)
+            x_audio = x_audio.to(device)
+
+            xvector = xvector_model.encode_batch(x_audio.squeeze()).squeeze()
+            x_spec = get_mel(x_audio.to('cpu'), sr).to(device)
+
+            y_g_hat = generator(x_audio, x_spec, xvector)             
+
             audio = y_g_hat.squeeze(1)
             filename = os.path.basename(filepath)
 

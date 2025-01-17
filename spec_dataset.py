@@ -13,6 +13,8 @@ from librosa.filters import mel as librosa_mel_fn
 from augmentation import AudioAugmenter
 import torchaudio
 
+from speechbrain.inference.speaker import EncoderClassifier
+
 MAX_WAV_VALUE = 32768.0
 
 def load_wav(full_path, target_sr):
@@ -124,6 +126,7 @@ class MelDataset(torch.utils.data.Dataset):
         self._cache_ref_count = 0
         self.device = device
         self.spectrogram_fn = T.Spectrogram(n_fft=1024, hop_length=256, win_length=1024, power=1.0, normalized=True, center=False)
+        self.xvector_model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-xvect-voxceleb", savedir="pretrained_xvector_model/spkrec-xvect-voxceleb", run_opts={"device": "cpu"}).eval()
         
     def __getitem__(self, index):
         filename = os.path.join(self.data_dir, self.audio_files[index])
@@ -132,6 +135,7 @@ class MelDataset(torch.utils.data.Dataset):
             try:
                 #audio, sampling_rate = load_wav(filename)
                 clean_audio, sampling_rate = load_wav(filename, self.sampling_rate)
+                #xvector = torch.load(filename.replace('wav', 'pt'))
                 clean_audio = clean_audio / clean_audio.abs().max()
                 input_audio = clean_audio / clean_audio.abs().max()
             except Exception as e:
@@ -143,7 +147,10 @@ class MelDataset(torch.utils.data.Dataset):
             if sampling_rate != self.sampling_rate:
                 raise ValueError("{} Sampling_rate doesn't match target {} sampling_rate".format(
                     sampling_rate, self.sampling_rate))
-            
+                #fn_resample = torchaudio.transforms.Resample(orig_freq=sampling_rate, new_freq=self.sampling_rate, resampling_method='sinc_interp_hann')
+                #clean_audio = fn_resample(clean_audio)
+                #input_audio = clean_audio
+
             # Apply audio augmentations if any
             if self.audio_augmenter:
                 # Apply the augmentations
@@ -182,6 +189,9 @@ class MelDataset(torch.utils.data.Dataset):
         input_spec = self.spectrogram_fn(input_audio).squeeze()
         clean_spec = self.spectrogram_fn(clean_audio).squeeze()
 
+        with torch.no_grad():
+            xvector = self.xvector_model.encode_batch(noisy_audio).squeeze()
+
         if len(input_audio.shape) != 2:
             input_audio = input_audio.squeeze()
 
@@ -194,7 +204,7 @@ class MelDataset(torch.utils.data.Dataset):
         if len(clean_spec.shape) != 3:
             clean_spec = clean_spec.squeeze()
                     
-        return (input_audio, input_spec, clean_audio, clean_spec)
+        return (input_audio, input_spec, clean_audio, clean_spec, xvector)
 
     def __len__(self):
         return len(self.audio_files)
