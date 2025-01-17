@@ -69,42 +69,8 @@
             "fft_sizes": [512, 1024, 2048]
         }
     },
-    "augmentations": [
-        {
-            "name": "AddBackgroundNoise",
-            "params": {
-                "background_paths": "/root/DNS_DATASET/datasets_fullband_16khz/noise_fullband_16khz/",
-                "min_snr_in_db": 10.0,
-                "max_snr_in_db": 20.0,
-                "p": 0.6
-            }
-        },
-        {
-            "name": "ApplyImpulseResponse",
-            "params": {
-                "ir_paths": "/root/DNS_DATASET/datasets_fullband_16khz/impulse_responses_16khz",
-                "p": 0.3
-            }
-        },   
-        {
-            "name": "Gain",
-            "params": {
-                "min_gain_in_db": -6.0,
-                "max_gain_in_db": 6.0,
-                "p": 0.3
-            }             
-        },
-        {
-            "name": "AddColoredNoise",
-            "params": {
-                "min_snr_in_db": 10.0,
-                "max_snr_in_db": 20.0,
-                "min_f_decay": -1.0,
-                "max_f_decay": 1.0,
-                "p": 0.6
-            }
-        }         
-    ],
+    "augmentations": null,
+
     "num_workers": 24,
 
     "dist_config": {

@@ -13,6 +13,7 @@ import torch.multiprocessing as mp
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
 import torchaudio.transforms as T
+import torchaudio.functional as F_audio
 from env import AttrDict, build_env
 #from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from spec_dataset import MelDataset, mel_spectrogram, get_dataset_filelist
@@ -31,6 +32,13 @@ torch.backends.cudnn.benchmark = True
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Running on device: {}".format(device))
 
+N_FFT=1024
+HOP_LENGTH=256 
+WIN_LENGTH=1024
+POWER=1.0
+NORMALIZED=True
+CENTER=False
+
 '''
 def pad_spectrogram(spec1, spec2):
     # Source: https://github.com/jik876/hifi-gan/issues/52
@@ -41,9 +49,9 @@ def pad_spectrogram(spec1, spec2):
     return spec1, spec2
 '''
 def pad_spectrogram(spec1, spec2):
-    # Garantir que os tensores tenham 3 dimensões
+    # Ensure tensors have 3 dimensions
     if len(spec1.size()) < 3 or len(spec2.size()) < 3:
-        raise ValueError("Espectrogramas esperados com pelo menos 3 dimensões, mas recebidos: spec1.size={} e spec2.size={}".format(spec1.size(), spec2.size()))
+        raise ValueError("Expected spectrograms with at least 3 dimensions, but received: spec1.size={} and spec2.size={}".format(spec1.size(), spec2.size()))
 
     # Source: https://github.com/jik876/hifi-gan/issues/52
     if spec1.size(2) > spec2.size(2):
@@ -61,21 +69,46 @@ def pad_waveform(wav1, wav2):
     return wav1, wav2
 
 
-spectrogram_fn = T.Spectrogram(n_fft=1024, hop_length=256, win_length=1024, power=1.0, normalized=True, center=False).to(device)
+def check_for_nan_and_inf(tensor, tensor_name="tensor"):
+    if torch.isnan(tensor).any():
+        raise ValueError(f"{tensor_name} chas NaN values!")
+    if torch.isinf(tensor).any():
+        raise ValueError(f"{tensor_name} has Inf values!")
+
+
+#spectrogram_fn = T.Spectrogram(n_fft=1024, hop_length=256, win_length=1024, power=1.0, normalized=True, center=False).to(device)
 
 def validation(generator, validation_loader, sw, h, steps, device, first=False):
     generator.eval()
     torch.cuda.empty_cache()
-    val_err_tot = 0
+    val_err_spec_tot = 0
+    val_err_audio_tot = 0
+
     with torch.no_grad():
         for j, batch in enumerate(validation_loader):
             x_audio, x_spec, y_audio, y_spec = batch
             x_audio, x_spec, y_audio, y_spec = x_audio.to(device), x_spec.to(device), y_audio.to(device), y_spec.to(device)
             y_g_hat = generator(x_audio, x_spec)
-            y_g_hat_spec = spectrogram_fn(y_g_hat.squeeze(1))#.squeeze()
+            
+            #y_g_hat_spec = spectrogram_fn(y_g_hat.squeeze(1))#.squeeze()
+
+            window = torch.hann_window(N_FFT).to(y_g_hat.get_device())
+            y_g_hat_spec = F_audio.spectrogram(
+                y_g_hat.squeeze(1),
+                pad=0,
+                window=window,
+                n_fft=N_FFT,
+                hop_length=HOP_LENGTH,
+                win_length=WIN_LENGTH,
+                power=POWER,  # Use 2.0 for power spectrogram or None for complex spectrogram
+                normalized=NORMALIZED,
+                center=CENTER
+            )
+
             # FRED: upsampling
             y_spec, y_g_hat_spec = pad_spectrogram(y_spec, y_g_hat_spec)
-            val_err_tot += F.l1_loss(y_spec, y_g_hat_spec).item()
+            val_err_spec_tot += F.l1_loss(y_spec, y_g_hat_spec).item()
+            val_err_audio_tot = F.l1_loss(y_audio, y_g_hat).item()
 
             if j <= 4:
                 if steps == 0 or first:
@@ -99,9 +132,12 @@ def validation(generator, validation_loader, sw, h, steps, device, first=False):
                                                 h.fmin, h.fmax)
                 sw.add_figure('noisy/x_spec_{}'.format(j),
                                 plot_spectrogram(x_hat_spec.squeeze(0).cpu().numpy()), steps)
-        val_err = val_err_tot / (j+1)
 
-        sw.add_scalar("validation/mel_spec_error", val_err, steps)
+        val_spec_err = val_err_spec_tot / (j+1)
+        val_audio_err = val_err_audio_tot / (j+1)
+
+        sw.add_scalar("validation/mel_spec_error", val_spec_err, steps)
+        sw.add_scalar("validation/audio_error", val_audio_err, steps)
 
     generator.train()
 
@@ -159,6 +195,7 @@ def train(rank, a, h):
         state_dict_g = load_checkpoint(cp_g, device)
         state_dict_do = load_checkpoint(cp_do, device)
         generator.load_state_dict(state_dict_g['generator'])
+        #generator.load_state_dict(state_dict_g['state_dict'])
         mpd.load_state_dict(state_dict_do['mpd'])
         msd.load_state_dict(state_dict_do['msd'])
         steps = state_dict_do['steps'] + 1
@@ -171,7 +208,17 @@ def train(rank, a, h):
     if h.freeze_cleanunet:
         for param in generator.clean_unet.parameters():
             param.requires_grad = False
-             
+
+    if h.freeze_cleanunet2:
+        for param in generator.parameters():
+            param.requires_grad = False
+
+        for param in generator.clean_unet.parameters():
+            param.requires_grad = False
+
+        for param in generator.clean_spec_net.parameters():
+            param.requires_grad = False
+
 
     if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
@@ -182,9 +229,20 @@ def train(rank, a, h):
     optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
                                 h.learning_rate, betas=[h.adam_b1, h.adam_b2])
 
+
     if state_dict_do is not None:
         optim_g.load_state_dict(state_dict_do['optim_g'])
         optim_d.load_state_dict(state_dict_do['optim_d'])
+
+    '''
+    for param_group in optim_g.param_groups:
+        if 'initial_lr' not in param_group:
+            param_group['initial_lr'] = h.learning_rate
+
+    for param_group in optim_d.param_groups:
+        if 'initial_lr' not in param_group:
+            param_group['initial_lr'] = h.learning_rate
+    '''
 
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
@@ -233,10 +291,12 @@ def train(rank, a, h):
     else:
         mrstftloss = None
 
-    loss_cleanunet_fn = CleanUNet2Loss(
-                            **h.loss_config,
-                            mrstftloss=mrstftloss)
+    #loss_cleanunet_fn = CleanUNet2Loss(
+    #                        **h.loss_config,
+    #                        mrstftloss=mrstftloss)
+    loss_cleanunet_fn = torch.nn.L1Loss()
 
+    print(f"Epoch {last_epoch + 1}: LR = {scheduler_g.get_last_lr()[0]}")
     for epoch in range(max(0, last_epoch), a.training_epochs):
         if rank == 0:
             start = time.time()
@@ -250,15 +310,33 @@ def train(rank, a, h):
                 start_b = time.time()
             
             x_audio, x_spec, y_audio, y_spec = batch 
-            # x_audio : (batch_size, 1, segment_size)
-            # x_spec : (batch_size, fft, segment_size)
-            # y_audio : (batch_size, 1, segment_size)
-            # y_spec : (batch_size, fft, segment_size)
-
             x_audio, x_spec, y_audio, y_spec = x_audio.to(device), x_spec.to(device), y_audio.to(device), y_spec.to(device)
 
+            # NaN and Inf tensor check
+            try:
+                check_for_nan_and_inf(x_audio, "x_audio")
+                check_for_nan_and_inf(x_spec, "x_spec")
+                check_for_nan_and_inf(y_audio, "y_audio")
+                check_for_nan_and_inf(y_spec, "y_spec")
+            except ValueError as e:
+                print(e)
+                continue
+
             y_g_hat = generator(x_audio, x_spec) # (batch_size, 1, segment_size)
-            y_g_hat_spec = spectrogram_fn(y_g_hat).squeeze() # (batch_size, fft, segment_size)
+            #y_g_hat_spec = spectrogram_fn(y_g_hat).squeeze() # (batch_size, fft, segment_size)
+            window = torch.hann_window(N_FFT).to(y_g_hat.get_device())
+            y_g_hat_spec = F_audio.spectrogram(
+                y_g_hat.squeeze(1),
+                pad=0,
+                window=window,
+                n_fft=N_FFT,
+                hop_length=HOP_LENGTH,
+                win_length=WIN_LENGTH,
+                power=POWER,  # Use 2.0 for power spectrogram or None for complex spectrogram
+                normalized=NORMALIZED,
+                center=CENTER
+            ).squeeze()
+
 
             optim_d.zero_grad()
 
@@ -273,9 +351,9 @@ def train(rank, a, h):
 
             loss_disc_all = loss_disc_s + loss_disc_f
 
-            loss_disc_all.backward()
-
             # Discriminator
+            loss_disc_all.backward()
+            grad_norm_d = torch.nn.utils.clip_grad_norm_(itertools.chain(msd.parameters(), mpd.parameters()), max_norm=h.grad_clip, norm_type=h.norm_type)
             optim_d.step()
 
             # Generator
@@ -285,8 +363,7 @@ def train(rank, a, h):
             #y_spec, y_g_hat_spec = pad_spectrogram(y_spec, y_g_hat_spec)
 
             # L1 Mel-Spectrogram Loss
-
-            #loss_spec = F.l1_loss(y_spec, y_g_hat_spec) * 45
+            loss_spec = F.l1_loss(y_spec, y_g_hat_spec) * 45
 
             #y_audio, y_g_hat = pad_waveform(y_audio, y_g_hat)            
             loss_cleanunet = loss_cleanunet_fn(y_audio, y_g_hat)
@@ -297,13 +374,11 @@ def train(rank, a, h):
             loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
             loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
             loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_cleanunet # + loss_spec
+            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_cleanunet  + loss_spec
 
+            # Generator
             loss_gen_all.backward()
-
-            grad_norm_g = torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
-            grad_norm_d = torch.nn.utils.clip_grad_norm_(itertools.chain(msd.parameters(), mpd.parameters()), 1.0)
-
+            grad_norm_g = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=h.grad_clip, norm_type=h.norm_type)
             optim_g.step()
 
             if rank == 0:
@@ -362,7 +437,7 @@ def main():
     #parser.add_argument('--input_validation_file', default='./filelists/ljs_audio_text_val_filelist.txt')
     parser.add_argument('--checkpoint_path', default='logs_training')
     parser.add_argument('--config', default='configs/config.json')
-    parser.add_argument('--training_epochs', default=1000, type=int)
+    parser.add_argument('--training_epochs', default=1000000, type=int)
     parser.add_argument('--stdout_interval', default=5, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
