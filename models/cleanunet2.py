@@ -7,92 +7,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
 
-class SpectrogramUpSampler(nn.Module):
-    """
-    Rede neural para up-sampling de espectrogramas usando convoluções transpostas 2D.
-    
-    Recebe um espectrograma com dimensões (Batch_size, n_freq=513, len_seq)
-    e realiza up-sampling por um fator de ~304 na dimensão temporal através de
-    duas camadas de convolução transposta 2D.
-    """
-    def __init__(self, n_freq=513, upsample_factor=304, alpha=0.4):
-        super(SpectrogramUpSampler, self).__init__()
-        
-        self.upsample_factor = upsample_factor
-        self.alpha = alpha
-        
-        # Primeira camada de convolução transposta com fator de ~17
-        self.conv_trans1 = nn.ConvTranspose2d(
-            in_channels=1,
-            out_channels=16,
-            kernel_size=(33, 4),
-            stride=(1, 16),  # Fator de upsampling 16x
-            padding=(16, 1),
-            bias=False
-        )
-        self.leaky_relu1 = nn.LeakyReLU(negative_slope=self.alpha, inplace=False)
-        
-        # Segunda camada de convolução transposta com fator de ~16 para chegar no fator total ~256
-        self.conv_trans2 = nn.ConvTranspose2d(
-            in_channels=16,
-            out_channels=1,
-            kernel_size=(33, 4),
-            stride=(1, 16),  # Fator de upsampling 16x
-            padding=(16, 1),
-            bias=False
-        )
-        self.leaky_relu2 = nn.LeakyReLU(negative_slope=self.alpha, inplace=False)
-        
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        x = self.conv_trans1(x)
-        x = self.leaky_relu1(x)
-        x = self.conv_trans2(x)
-        x = self.leaky_relu2(x)
-        x = x.squeeze(1)
-        return x
-
-
-class SpectrogramReducer(nn.Module):
-    def __init__(self, in_channels=513, out_channels=1):
-        super(SpectrogramReducer, self).__init__()
-        self.conv1x1 = nn.Conv1d(
-            in_channels=in_channels, 
-            out_channels=out_channels, 
-            kernel_size=1
-        )
-        
-    def forward(self, x):
-        return self.conv1x1(x)
-
-
-class CleanSpecNetPosNet(nn.Module):
-    def __init__(self, in_channels=513, out_channels=1):
-        super(CleanSpecNetPosNet, self).__init__()
-        self.upsampler = SpectrogramUpSampler()
-        self.reducer = SpectrogramReducer()
-
-    def forward(self, x):
-        upsampled_spectrogram = self.upsampler(x)
-        reduced_spectrogram = self.reducer(upsampled_spectrogram)
-        return reduced_spectrogram
-
-
-class CleanUNetPreNet(nn.Module):
+class WaveformConditioner(nn.Module):
     def __init__(self, in_channels=2, out_channels=1):
-        super(CleanUNetPreNet, self).__init__()
+        super(WaveformConditioner, self).__init__()
         self.conv1x1 = nn.Conv1d(
             in_channels=in_channels, 
             out_channels=out_channels, 
             kernel_size=1
-        )
-        
+        )  
+        self.fn = nn.LeakyReLU(negative_slope=0.4, inplace=False)
     def forward(self, x):
-        return self.conv1x1(x)
- 
-            
+        return self.fn(self.conv1x1(x))
+    
+
 # CleanUNet2 (Hybrid Model)
 class CleanUNet2(nn.Module):
     def __init__(self, 
@@ -144,27 +73,43 @@ class CleanUNet2(nn.Module):
             num_heads=cleanspecnet_num_heads, 
             dropout=cleanspecnet_dropout
         )
-        self.cleanspecnet_posnet = CleanSpecNetPosNet()
-        self.cleanunet_prenet = CleanUNetPreNet()
+        self.WaveformConditioner = WaveformConditioner()    
 
+
+    def _reconstruct_waveform(self, noisy_waveform, denoised_spectrogram, n_fft=1024, hop_length=256, window_fn=torch.hann_window):
+        # Compute STFT of the noisy waveform to get phase information
+        stft_noisy = torch.stft(
+            noisy_waveform.squeeze(1),  # Remove channel dimension if necessary
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window_fn(n_fft).to(noisy_waveform.device),
+            return_complex=True,
+            center=False,
+            normalized=True
+        )  # Shape: (batch_size, freq_bins, time_frames)
+        # Get the phase from the noisy STFT
+        phase_noisy = torch.angle(stft_noisy)
+        # Reconstruct the complex spectrogram using denoised magnitude and noisy phase
+        denoised_complex_spectrogram = denoised_spectrogram * torch.exp(1j * phase_noisy)
+        # Perform ISTFT to reconstruct waveform
+        reconstructed_waveform = torch.istft(
+            denoised_complex_spectrogram,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window_fn(n_fft).to(noisy_waveform.device),
+            length=noisy_waveform.shape[-1]
+        )
+        # Add channel dimension back if necessary
+        reconstructed_waveform = reconstructed_waveform.unsqueeze(1)
+        return reconstructed_waveform
+    
 
     def forward(self, noisy_waveform, noisy_spectrogram):
-
         denoised_spectrogram = self.clean_spec_net(noisy_spectrogram)
-        reduced_spectrogram = self.cleanspecnet_posnet(denoised_spectrogram)
-
-        if reduced_spectrogram.shape[-1] < noisy_waveform.shape[-1]:
-            padded_reduced_spectrogram = F.pad(reduced_spectrogram, (0, noisy_waveform.shape[-1] - reduced_spectrogram.shape[-1]))
-            padded_noisy_waveform = noisy_waveform
-        else:
-            padded_reduced_spectrogram = reduced_spectrogram
-            padded_noisy_waveform = F.pad(noisy_waveform, (0, reduced_spectrogram.shape[-1] - noisy_waveform.shape[-1]))
-
-        conditioned_waveform = torch.cat((padded_noisy_waveform, padded_reduced_spectrogram), dim=1)
-
-        conditioned_waveform = self.cleanunet_prenet(conditioned_waveform)
-                
-        denoised_waveform = self.clean_unet(conditioned_waveform)
+        reconstructed_waveform = self._reconstruct_waveform(noisy_waveform, denoised_spectrogram)
+        concat_waveform = torch.cat((noisy_waveform, reconstructed_waveform), dim=1)
+        concat_waveform = self.WaveformConditioner(concat_waveform)
+        denoised_waveform = self.clean_unet(concat_waveform)
         return denoised_waveform, denoised_spectrogram
 
 
@@ -182,7 +127,7 @@ if __name__ == '__main__':
     print(f"Noisy waveform shape: {noisy_waveform.shape}")
     print(f"Noisy spectrogram shape: {noisy_spectrogram.shape}")
     denoised_waveform, denoised_spec = model(noisy_waveform, noisy_spectrogram)
-    print(f"denoised_waveform waveform shape: {denoised_waveform.shape}")
+    print(f"Denoised_waveform waveform shape: {denoised_waveform.shape}")
     print(f"Clean waveform shape: {clean_waveform.shape}")
 
     loss = torch.nn.MSELoss()(clean_waveform, denoised_waveform)

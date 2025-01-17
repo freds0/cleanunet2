@@ -79,6 +79,8 @@ class CleanUNet2Dataset(Dataset):
         else:
             audio_wav = audio_wav.squeeze(0)
             
+        audio_wav = audio_wav / audio_wav.abs().max()
+        
         return audio_wav
     
 
@@ -89,20 +91,21 @@ class CleanUNet2Dataset(Dataset):
         
         # Load the audio file
         audio = self._load_audio_and_resample(filepath, self.sample_rate)
-        if type(audio) == bool and audio == False:
+        if isinstance(audio, bool) and audio == False:
             # If there's an error, try loading the next audio file
             return self.__getitem__((index + 1) % len(self))
 
         # Normalize the audio to have values between -1 and 1
-        #audio = audio / audio.abs().max()
+        audio = audio / audio.abs().max()
 
         # Ensure audio length is a multiple of hop_length
+        '''
         num_frames = int(np.ceil((len(audio) - self.spectrogram_fn.n_fft) / self.spectrogram_fn.hop_length)) + 1
         total_length = (num_frames - 1) * self.spectrogram_fn.hop_length + self.spectrogram_fn.n_fft
         padding = total_length - len(audio)
         if padding > 0:
             audio = F.pad(audio, (0, padding))
-
+        '''
         # Apply cropping if specified
         crop_length = int(self.crop_length_sec * self.sample_rate)
         if crop_length > 0 and crop_length < len(audio):
@@ -112,12 +115,7 @@ class CleanUNet2Dataset(Dataset):
 
         # Apply audio augmentations if any
         if self.audio_augmenter:
-            # Convert the tensor to a NumPy array for augmentation
-            audio_np = audio.numpy()
-            # Apply the augmentations
-            audio_np = self.audio_augmenter.apply(audio_np, self.sample_rate)
-            # Convert back to a tensor
-            noisy_audio = torch.from_numpy(audio_np)
+            noisy_audio = self.audio_augmenter.apply(audio, self.sample_rate)
         else:
             # If there are no augmentations, noisy audio is the same as clean audio.
             noisy_audio = audio.clone()
@@ -129,14 +127,28 @@ class CleanUNet2Dataset(Dataset):
         clean_audio = clean_audio[:min_length]
         noisy_audio = noisy_audio[:min_length]
 
+        # **Ensure audio length is at least n_fft samples**
+        min_length_required = self.spectrogram_fn.n_fft
+        if len(clean_audio) < min_length_required:
+            padding = min_length_required - len(clean_audio)
+            clean_audio = F.pad(clean_audio, (0, padding))
+            noisy_audio = F.pad(noisy_audio, (0, padding))
+                    
+        # **Ensure audio length is a multiple of hop_length**
+        num_frames = int(np.ceil((len(clean_audio) - self.spectrogram_fn.n_fft) / self.spectrogram_fn.hop_length)) + 1
+        total_length = (num_frames - 1) * self.spectrogram_fn.hop_length + self.spectrogram_fn.n_fft
+        padding = total_length - len(clean_audio)
+        if padding > 0:
+            clean_audio = F.pad(clean_audio, (0, padding))
+            noisy_audio = F.pad(noisy_audio, (0, padding))
+
         # Add channel dimension
         clean_audio = clean_audio.unsqueeze(0)
         noisy_audio = noisy_audio.unsqueeze(0)
         
         # Get the spectrograms
-        clean_spec = self.spectrogram_fn(clean_audio).squeeze()
-        noisy_spec = self.spectrogram_fn(noisy_audio).squeeze()
-
+        clean_spec = self.spectrogram_fn(clean_audio)#.squeeze()
+        noisy_spec = self.spectrogram_fn(noisy_audio)#.squeeze()
 
         return (clean_audio, clean_spec, noisy_audio, noisy_spec)
 
@@ -147,41 +159,40 @@ class CleanUNet2Dataset(Dataset):
 
 def collate_fn(batch):
     clean_audios, clean_specs, noisy_audios, noisy_specs = zip(*batch)    
+    
+    # Determine the maximum audio length in the batch
+    max_audio_len = max([audio.shape[-1] for audio in clean_audios])    
 
+    # Pad audio tensors to have the same length
     padded_clean_audios = []
     padded_noisy_audios = []
-    max_audio_len = max([audio.shape[1] for audio in clean_audios])    
-    # Fill the spectrograms to be the same size
     for clean_audio, noisy_audio in zip(clean_audios, noisy_audios):
-        pad_time = max_audio_len - clean_audio.shape[1]
-        # There is no padding on the frequency, so pad_top and pad_bottom are zero
-        pad = (0, pad_time, 0, 0)  # (pad_left, pad_right, pad_top, pad_bottom)
-        padded_clean_audio = F.pad(clean_audio, pad) 
+        pad_time = max_audio_len - clean_audio.shape[-1]
+        pad = (0, pad_time)  # Pad last dimension
+        padded_clean_audio = F.pad(clean_audio, pad)
         padded_noisy_audio = F.pad(noisy_audio, pad)
         padded_clean_audios.append(padded_clean_audio)
         padded_noisy_audios.append(padded_noisy_audio)
 
-    # Stack the tensors to form the batch
-    clean_audio_batch = torch.stack(padded_clean_audios)
-    noisy_audio_batch = torch.stack(padded_noisy_audios)
+    # Concatenate tensors along the batch dimension
+    clean_audio_batch = torch.cat(padded_clean_audios, dim=0).unsqueeze(1)
+    noisy_audio_batch = torch.cat(padded_noisy_audios, dim=0).unsqueeze(1)
 
+    # Similarly pad the spectrograms
+    max_spec_time_len = max([spec.shape[-1] for spec in clean_specs])    
     padded_clean_specs = []
     padded_noisy_specs = []
-    max_spec_time_len = max([spec.shape[1] for spec in clean_specs])    
-    # Fill the spectrograms to be the same size
     for clean_spec, noisy_spec in zip(clean_specs, noisy_specs):
-        pad_time = max_spec_time_len - clean_spec.shape[1]
-        # There is no padding on the frequency, so pad_top and pad_bottom are zero
-        pad = (0, pad_time, 0, 0)  # (pad_left, pad_right, pad_top, pad_bottom)
-        padded_clean_spec = F.pad(clean_spec, pad) 
+        pad_time = max_spec_time_len - clean_spec.shape[-1]
+        pad = (0, pad_time)  # Pad last dimension
+        padded_clean_spec = F.pad(clean_spec, pad)
         padded_noisy_spec = F.pad(noisy_spec, pad)
         padded_clean_specs.append(padded_clean_spec)
         padded_noisy_specs.append(padded_noisy_spec)
     
-    # Stack the tensors to form the batch
-    clean_spec_batch = torch.stack(padded_clean_specs)
-    noisy_spec_batch = torch.stack(padded_noisy_specs)
-
+    clean_spec_batch = torch.cat(padded_clean_specs, dim=0)
+    noisy_spec_batch = torch.cat(padded_noisy_specs, dim=0)
+      
     return clean_audio_batch, clean_spec_batch, noisy_audio_batch, noisy_spec_batch
 
 
