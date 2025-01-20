@@ -6,11 +6,14 @@ import argparse
 import json
 import torch
 import torchaudio
+import torchaudio.transforms as T
 from tqdm import tqdm
 #from scipy.io.wavfile import write
 from env import AttrDict
-from meldataset import mel_spectrogram, MAX_WAV_VALUE, load_wav
-from models import Generator
+from spec_dataset import load_wav
+#from spec_dataset import mel_spectrogram, MAX_WAV_VALUE, load_wav
+#from models import Generator
+from cleanunet import CleanUNet2
 from glob import glob
 
 h = None
@@ -28,7 +31,7 @@ def convert_stereo_to_mono(waveform):
     mono_waveform = torch.mean(waveform, dim=0, keepdim=True).squeeze(1)
     return mono_waveform
 
-
+'''
 def get_mel(x, sr=None):
 
     if h.input_sampling_rate != h.output_sampling_rate:
@@ -44,6 +47,7 @@ def get_mel(x, sr=None):
             x = audio_resample(x.to("cpu"))
         mel = mel_spectrogram(x, h.n_fft, h.num_mels, h.input_sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax)
     return mel
+'''
 
 
 def scan_checkpoint(cp_dir, prefix):
@@ -55,7 +59,8 @@ def scan_checkpoint(cp_dir, prefix):
 
 
 def inference(a, device):
-    generator = Generator(h).to(device)
+    #generator = Generator(h).to(device)
+    generator = CleanUNet2(**h.cleanunet2_config).to(device)
 
     state_dict_g = load_checkpoint(a.checkpoint_file, device)
     generator.load_state_dict(state_dict_g['generator'])
@@ -66,28 +71,32 @@ def inference(a, device):
     os.makedirs(a.output_dir, exist_ok=True)
 
     generator.eval()
-    generator.remove_weight_norm()
-    with torch.no_grad():
-        for i, filepath in enumerate(tqdm(filelist)):
-            #wav, sr = load_wav(os.path.join(a.input_wavs_dir, filepath))
-            wav, sr = load_wav(filepath)
-            print(wav.shape)
-            if wav.shape[0] > 1:
-                wav = convert_stereo_to_mono(wav)
-            wav = wav.to(device)
+    #generator.remove_weight_norm()
+    spectrogram_fn = T.Spectrogram(n_fft=1024, hop_length=256, win_length=1024, power=1.0, normalized=True, center=False)
 
-            x = get_mel(wav.to('cpu'), sr).to(device)
-            y_g_hat = generator(x)
+    with torch.no_grad():
+        for i, filepath in enumerate(tqdm(filelist)):            
+            x_audio, sr = load_wav(filepath, target_sr=h.sampling_rate)
+
+            if x_audio.shape[0] > 1:
+                x_audio = convert_stereo_to_mono(x_audio)
+
+            x_audio = x_audio.squeeze()
+            x_spec = spectrogram_fn(x_audio).squeeze()
+
+            x_audio = x_audio.unsqueeze(0).unsqueeze(1) # add batch and channel dimension: [1, 1, T]
+            x_spec = x_spec.unsqueeze(0) # add batch dimension: [1, F, T]
+
+            x_audio, x_spec = x_audio.to(device), x_spec.to(device)
+            y_g_hat = generator(x_audio, x_spec)             
+
             audio = y_g_hat.squeeze(1)
             filename = os.path.basename(filepath)
 
-            #folder = os.path.dirname(filepath).split('/')[-1]
-            #output_file = os.path.join(a.output_dir, folder, os.path.splitext(filename)[0] + '.wav')
             output_file = os.path.join(a.output_dir, os.path.splitext(filename)[0] + '.wav')
 
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-            torchaudio.save(output_file, audio.to('cpu'), h.output_sampling_rate)
+            torchaudio.save(output_file, audio.to('cpu'), h.sampling_rate)
 
 
 
