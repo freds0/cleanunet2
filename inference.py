@@ -42,13 +42,17 @@ random.seed(0)
 torch.manual_seed(0)
 np.random.seed(0)
 
-from scipy.io.wavfile import write as wavwrite
-from scipy.io.wavfile import read as wavread
+#from scipy.io.wavfile import write as wavwrite
+#from scipy.io.wavfile import read as wavread
+import torchaudio
+import torchaudio.transforms as T
 
 from util import rescale, find_max_epoch, print_size, sampling
-from network import CleanUNet
+from dataset import CleanUNet2Dataset
+#from network import CleanUNet
+from models import CleanUNet2
 
-def denoise(output_dir, ckpt_path, input_dir):
+def denoise(output_dir, ckpt_path, input_dir, device=None):
     """
     Denoise audio files in a directory.
 
@@ -58,17 +62,19 @@ def denoise(output_dir, ckpt_path, input_dir):
     input_dir (str):                Directory containing .wav files to denoise.
     """
 
+    device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Setup local experiment path
     exp_path = train_config["exp_path"]
     print('exp_path:', exp_path)
 
     # Predefine model
-    net = CleanUNet(**network_config).cuda()
+    net = CleanUNet2(**network_config).cuda()
     print_size(net)
 
     # Load checkpoint
     checkpoint = torch.load(ckpt_path, map_location='cpu')
-    net.load_state_dict(checkpoint['model_state_dict'])
+    net.load_state_dict(checkpoint['state_dict'])
+    net = net.to(device)
     net.eval()
 
     if not os.path.isdir(output_dir):
@@ -79,11 +85,19 @@ def denoise(output_dir, ckpt_path, input_dir):
     # Inference
     import glob
     wav_files = glob.glob(os.path.join(input_dir, '*.wav'))
+    spectrogram_fn = T.Spectrogram(n_fft=trainset_config["n_fft"], hop_length=trainset_config["hop_length"], win_length=trainset_config["win_length"], power=trainset_config["power"], normalized=True, center=False)
+
     for wav_file in tqdm(wav_files):
         filename = os.path.basename(wav_file)
-        sample_rate, audio = wavread(wav_file)
-        assert sample_rate == trainset_config["sample_rate"], "Sample rate mismatch."
+        #sample_rate, audio = wavread(wav_file)
+        #assert sample_rate == trainset_config["sample_rate"], "Sample rate mismatch."
+        audio = CleanUNet2Dataset._load_audio_and_resample(wav_file, trainset_config["sample_rate"])
+        spec = spectrogram_fn(audio)
 
+        audio = audio.unsqueeze(0).unsqueeze(1)
+        spec = spec.unsqueeze(0)
+
+        '''
         # If audio is stereo, convert to mono
         if len(audio.shape) == 2:
             audio = audio.mean(axis=1)
@@ -98,17 +112,21 @@ def denoise(output_dir, ckpt_path, input_dir):
             raise ValueError("Unsupported audio data type: {}".format(audio.dtype))
 
         audio = torch.from_numpy(audio).float().unsqueeze(0).unsqueeze(0).cuda()  # Shape: [1, 1, L]
-
+        '''
+        audio, spec = audio.to(device), spec.to(device)
         # Denoise audio
-        generated_audio = sampling(net, audio)
+        denoised_audio, _ = net(audio, spec)
 
+        '''
         # Convert back to original data type
         enhanced_audio = generated_audio[0].squeeze().cpu().numpy()
         enhanced_audio = np.clip(enhanced_audio, -1.0, 1.0)
         output_audio = (enhanced_audio * max_value).astype(np.int16)
-
+        '''
         output_file = os.path.join(output_dir, filename)
-        wavwrite(output_file, trainset_config["sample_rate"], output_audio)
+        #wavwrite(output_file, trainset_config["sample_rate"], denoised_audio)
+        denoised_audio = denoised_audio.squeeze().unsqueeze(0).to("cpu").detach()#.numpy()
+        torchaudio.save(output_file, denoised_audio, trainset_config["sample_rate"])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
