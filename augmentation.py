@@ -43,13 +43,15 @@ class AudioAugmenter:
                 aug_list.append(AddColoredNoise(**params))
             else:
                 print(f"Warning: Unknown augmentation '{name}'")
-        return Compose(aug_list, shuffle=False, p=1.0) 
+        return Compose(aug_list, shuffle=True, p=1.0) 
 
     def apply(self, waveform, sr):
         # Set seed for reproducibility
         if self.seed is not None:
+            self.seed += random.randint(1, 1000)
             torch.manual_seed(self.seed) 
             random.seed(self.seed) 
+            self.seed += 1            
 
         # Ensure waveform is a tensor with shape (batch_size, num_channels, num_samples)
         waveform = waveform.reshape(1, 1, -1)
