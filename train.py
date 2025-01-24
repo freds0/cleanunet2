@@ -148,9 +148,6 @@ def validation(generator, validation_loader, sw, h, steps, device, first=False):
                 sw.add_audio('Audio/Denoised_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
                 sw.add_audio('Audio/Noisy_{}'.format(j), x_audio[0], steps, h.sampling_rate)
 
-            if j > 100:
-                break
-
         val_spec_err = val_err_spec_tot / (j+1)
         val_audio_err = val_err_audio_tot / (j+1)
 
@@ -449,7 +446,7 @@ def main():
     parser.add_argument('--stdout_interval', default=5, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
-    parser.add_argument('--validation_interval', default=10, type=int)
+    parser.add_argument('--validation_interval', default=1000, type=int)
 
     a = parser.parse_args()
 
