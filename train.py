@@ -458,8 +458,7 @@ def main():
 
     json_config = json.loads(data)
     h = AttrDict(json_config)
-    print(h.learning_rate)
-    exit()
+
     build_env(a.config, 'config.json', a.checkpoint_path)
 
     torch.manual_seed(h.seed)
