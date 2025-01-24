@@ -24,6 +24,11 @@ from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_check
 from cleanunet import CleanUNet2
 from losses import MultiResolutionSTFTLoss, CleanUnetLoss, CleanUNet2Loss
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+plt.ioff()
+
 import warnings
 warnings.filterwarnings("ignore", message=".*had to be resampled.*")
 
@@ -39,6 +44,7 @@ POWER=1.0
 NORMALIZED=True
 CENTER=False
 
+NUM_VAL_SAMPLES=4
 '''
 def pad_spectrogram(spec1, spec2):
     # Source: https://github.com/jik876/hifi-gan/issues/52
@@ -71,12 +77,13 @@ def pad_waveform(wav1, wav2):
 
 def check_for_nan_and_inf(tensor, tensor_name="tensor"):
     if torch.isnan(tensor).any():
-        raise ValueError(f"{tensor_name} chas NaN values!")
+        raise ValueError(f"{tensor_name} has NaN values!")
     if torch.isinf(tensor).any():
         raise ValueError(f"{tensor_name} has Inf values!")
+    
 
-
-#spectrogram_fn = T.Spectrogram(n_fft=1024, hop_length=256, win_length=1024, power=1.0, normalized=True, center=False).to(device)
+spectrogram_fn = T.Spectrogram(n_fft=1024, hop_length=256, win_length=1024, power=1.0, normalized=True, center=False).to(device)
+amplitude_to_db = T.AmplitudeToDB(stype='power')
 
 def validation(generator, validation_loader, sw, h, steps, device, first=False):
     generator.eval()
@@ -87,6 +94,16 @@ def validation(generator, validation_loader, sw, h, steps, device, first=False):
     with torch.no_grad():
         for j, batch in enumerate(validation_loader):
             x_audio, x_spec, y_audio, y_spec = batch
+
+            try:
+                check_for_nan_and_inf(x_audio, "val x_audio")
+                check_for_nan_and_inf(x_spec, "val x_spec")
+                check_for_nan_and_inf(y_audio, "val y_audio")
+                check_for_nan_and_inf(y_spec, "val y_spec")
+            except ValueError as e:
+                print(e)
+                continue
+
             x_audio, x_spec, y_audio, y_spec = x_audio.to(device), x_spec.to(device), y_audio.to(device), y_spec.to(device)
             y_g_hat = generator(x_audio, x_spec)
             
@@ -108,30 +125,27 @@ def validation(generator, validation_loader, sw, h, steps, device, first=False):
             # FRED: upsampling
             y_spec, y_g_hat_spec = pad_spectrogram(y_spec, y_g_hat_spec)
             val_err_spec_tot += F.l1_loss(y_spec, y_g_hat_spec).item()
-            val_err_audio_tot = F.l1_loss(y_audio, y_g_hat).item()
+            val_err_audio_tot += F.l1_loss(y_audio, y_g_hat).item()
 
-            if j <= 4:
-                if steps == 0 or first:
-                    y_spec = mel_spectrogram(y_audio[0].squeeze(1), h.n_fft, h.num_mels,
-                                                    h.sampling_rate, h.hop_size, h.win_size,
-                                                    h.fmin, h.fmax)                    
-                    sw.add_audio('target/y_{}'.format(j), y_audio[0], steps, h.sampling_rate)
-                    sw.add_figure('target/y_spec_{}'.format(j), plot_spectrogram(y_spec.squeeze(0).to('cpu')), steps)
+            if j < NUM_VAL_SAMPLES:
+                # Plot spectrograms
+                fig, axs = plt.subplots(1, 3, figsize=(15, 5))
 
-                sw.add_audio('denoised/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
-                y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
-                                                h.sampling_rate, h.hop_size, h.win_size,
-                                                h.fmin, h.fmax)
-                sw.add_figure('denoised/y_hat_spec_{}'.format(j),
-                                plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
+                axs[0].imshow(amplitude_to_db(y_spec).squeeze(0).to('cpu').numpy(), origin='lower', aspect='auto')
+                axs[0].set_title('Clean Spectrogram')
 
+                axs[1].imshow(amplitude_to_db(y_g_hat_spec).squeeze(0).cpu().numpy(), origin='lower', aspect='auto')
+                axs[1].set_title('Denoised Spectrogram')
 
-                sw.add_audio('noisy/x_{}'.format(j), x_audio[0], steps, h.sampling_rate)
-                x_hat_spec = mel_spectrogram(x_audio.squeeze(1), h.n_fft, h.num_mels,
-                                                h.sampling_rate, h.hop_size, h.win_size,
-                                                h.fmin, h.fmax)
-                sw.add_figure('noisy/x_spec_{}'.format(j),
-                                plot_spectrogram(x_hat_spec.squeeze(0).cpu().numpy()), steps)
+                axs[2].imshow(amplitude_to_db(x_spec).squeeze(0).cpu().numpy(), origin='lower', aspect='auto')
+                axs[2].set_title('Noisy Spectrogram')
+                plt.tight_layout()
+                sw.add_figure('Spectrograms/Sample_{}'.format(j), fig, steps)
+                plt.close(fig)
+
+                sw.add_audio('Audio/Clean_{}'.format(j), y_audio[0], steps, h.sampling_rate)
+                sw.add_audio('Audio/Denoised_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
+                sw.add_audio('Audio/Noisy_{}'.format(j), x_audio[0], steps, h.sampling_rate)
 
         val_spec_err = val_err_spec_tot / (j+1)
         val_audio_err = val_err_audio_tot / (j+1)
@@ -228,7 +242,6 @@ def train(rank, a, h):
     optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
     optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
                                 h.learning_rate, betas=[h.adam_b1, h.adam_b2])
-
 
     if state_dict_do is not None:
         optim_g.load_state_dict(state_dict_do['optim_g'])
@@ -407,6 +420,7 @@ def train(rank, a, h):
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
+                    sw.add_scalar("training/disc_loss_total", loss_disc_all, steps)
                     sw.add_scalar("training/mel_spec_error", spec_error, steps)
                     sw.add_scalar("training/gradient_norm_g", grad_norm_g, steps)
                     sw.add_scalar("training/gradient_norm_d", grad_norm_d, steps)
@@ -450,6 +464,7 @@ def main():
 
     json_config = json.loads(data)
     h = AttrDict(json_config)
+
     build_env(a.config, 'config.json', a.checkpoint_path)
 
     torch.manual_seed(h.seed)
